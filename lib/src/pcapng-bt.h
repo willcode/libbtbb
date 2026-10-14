@@ -44,6 +44,12 @@ typedef struct __attribute__((packed)) {
 typedef struct __attribute__((packed)) {
   enhanced_packet_block blk_header;
   pcap_bluetooth_bredr_bb_header bredr_bb_header;
+
+  /* Force 32 bit alignment, and space for OPTIONS and
+     BLOCK_TOTAL_LENGTH at the end of a full size block. */
+  uint8_t pad[2];
+  uint32_t options;
+  uint32_t blk_tot_length;
 } pcapng_bredr_packet;
 
 typedef struct __attribute__((packed)) {

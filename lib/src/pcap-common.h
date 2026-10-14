@@ -35,6 +35,7 @@
 #define be64toh EndianU64_BtoN
 #define htole16 EndianU16_NtoL
 #define htole32 EndianU32_NtoL
+#define htole64 EndianU64_NtoL
 #else
 #include <endian.h>
 #endif
@@ -127,6 +128,14 @@ typedef struct __attribute__((packed)) _pcap_bluetooth_le_ll_header {
 #define LE_MIC_CHECKED       0x1000
 #define LE_MIC_VALID         0x2000
 
-#define LE_MAX_PAYLOAD       255
+/* PDU type (bits 7-9) and PHY (bits 14-15) fields of the flags */
+#define LE_PDU_TYPE_SHIFT    7
+#define LE_PDU_TYPE_MASK     0x0380
+#define LE_PHY_SHIFT         14
+#define LE_PHY_MASK          0xc000
+
+/* largest LE packet: AA (4) + header (2-3) + payload (<= 255) + CRC (3),
+ * same as MAX_LE_SYMBOLS */
+#define LE_MAX_PAYLOAD       264
 
 #endif /* PCAP_COMMON_DOT_H */

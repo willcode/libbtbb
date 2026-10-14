@@ -57,7 +57,7 @@ FILE *btbb_pcap_open(const char *filename, uint32_t dlt, uint32_t snaplen) {
 		.network = dlt,
 	};
 
-	FILE *pcap_file = fopen(filename, "w");
+	FILE *pcap_file = fopen(filename, "wb");
 	if (pcap_file == NULL) return NULL;
 
 	fwrite(&pcap_header, sizeof(pcap_header), 1, pcap_file);
@@ -79,7 +79,7 @@ btbb_pcap_create_file(const char *filename, btbb_pcap_handle ** ph)
 	if (handle) {
 		memset(handle, 0, sizeof(*handle));
 		handle->pcap_file = btbb_pcap_open(filename, DLT_BLUETOOTH_BREDR_BB,
-											BREDR_MAX_PAYLOAD);
+						   sizeof(pcap_bluetooth_bredr_bb_header));
 		if (handle->pcap_file) {
 			*ph = handle;
 		}
@@ -140,7 +140,7 @@ assemble_pcapng_bredr_packet( pcap_bredr_packet * pkt,
 	uint32_t pcap_caplen = sizeof(pcap_bluetooth_bredr_bb_header) -
 				sizeof(pkt->bredr_bb_header.bredr_payload) 
 				+ caplen;
-	uint32_t reflapuap = (ref_lap&0xffffff) | (ref_uap<<24);
+	uint32_t reflapuap = (ref_lap&0xffffff) | ((uint32_t)ref_uap<<24);
 
 	pkt->pcap_header.ts_sec  = ns / 1000000000ull;
 	pkt->pcap_header.ts_usec = ns % 1000000000ull;
@@ -180,9 +180,13 @@ btbb_pcap_append_packet(btbb_pcap_handle * h, const uint64_t ns,
 			((noisedbm < sigdbm) ? BREDR_NOISEPOWER_VALID : 0) |
 			((reflap != LAP_ANY) ? BREDR_REFLAP_VALID : 0) |
 			((refuap != UAP_ANY) ? BREDR_REFUAP_VALID : 0);
-		uint32_t caplen = (uint32_t) btbb_packet_get_payload_length(pkt);
-		uint8_t payload_bytes[caplen];
-		btbb_get_payload_packed( pkt, (char *) &payload_bytes[0] );
+		int caplen = btbb_packet_get_payload_length(pkt);
+		/* payload_length never exceeds the payload buffer of the packet */
+		uint8_t payload_bytes[MAX_PAYLOAD_LENGTH / 8];
+		if (caplen < 0 || caplen > (int) sizeof(payload_bytes))
+			caplen = 0;
+		if (caplen)
+			btbb_get_payload_packed( pkt, (char *) &payload_bytes[0] );
 		caplen = MIN(BREDR_MAX_PAYLOAD, caplen);
 		pcap_bredr_packet pcap_pkt;
 		assemble_pcapng_bredr_packet( &pcap_pkt,
@@ -237,7 +241,10 @@ lell_pcap_create_file_dlt(const char *filename, int dlt, lell_pcap_handle ** ph)
 	lell_pcap_handle * handle = malloc( sizeof(lell_pcap_handle) );
 	if (handle) {
 		memset(handle, 0, sizeof(*handle));
-		handle->pcap_file = btbb_pcap_open(filename, dlt, BREDR_MAX_PAYLOAD);
+		/* large enough for the PPI headers or the LE PHDR plus a
+		 * maximum size LE packet */
+		handle->pcap_file = btbb_pcap_open(filename, dlt,
+						   sizeof(pcap_bluetooth_le_ll_header) + LE_MAX_PAYLOAD + 32);
 		if (handle->pcap_file) {
 			handle->dlt = dlt;
 			*ph = handle;
@@ -284,7 +291,8 @@ static void
 assemble_pcapng_le_packet( pcap_le_packet * pkt,
 			   const uint32_t interface_id __attribute__((unused)),
 			   const uint64_t ns,
-			   const uint32_t caplen,
+			   const uint32_t caplen,   /* length on the air */
+			   const uint32_t avail,    /* bytes captured */
 			   const uint8_t rf_channel,
 			   const int8_t signal_power,
 			   const int8_t noise_power,
@@ -293,12 +301,13 @@ assemble_pcapng_le_packet( pcap_le_packet * pkt,
 			   const uint16_t flags,
 			   const uint8_t * lepkt )
 {
-	uint32_t incl_len = MIN(LE_MAX_PAYLOAD, caplen);
+	uint32_t incl_len = MIN(MIN(LE_MAX_PAYLOAD, caplen), avail);
 
 	pkt->pcap_header.ts_sec  = ns / 1000000000ull;
 	pkt->pcap_header.ts_usec = ns % 1000000000ull;
-	pkt->pcap_header.incl_len = sizeof(pcap_bluetooth_le_ll_header)+caplen;
-	pkt->pcap_header.orig_len = sizeof(pcap_bluetooth_le_ll_header)+incl_len;
+	/* incl_len: bytes actually written; orig_len: length on the air */
+	pkt->pcap_header.incl_len = sizeof(pcap_bluetooth_le_ll_header)+incl_len;
+	pkt->pcap_header.orig_len = sizeof(pcap_bluetooth_le_ll_header)+caplen;
 
 	pkt->le_ll_header.rf_channel = rf_channel;
 	pkt->le_ll_header.signal_power = signal_power;
@@ -319,12 +328,14 @@ lell_pcap_append_packet(lell_pcap_handle * h, const uint64_t ns,
 		uint16_t flags = LE_DEWHITENED | LE_AA_OFFENSES_VALID |
 			LE_SIGPOWER_VALID |
 			((noisedbm < sigdbm) ? LE_NOISEPOWER_VALID : 0) |
-			(lell_packet_is_data(pkt) ? 0 : LE_REF_AA_VALID);
+			(lell_packet_is_data(pkt) ? 0 : LE_REF_AA_VALID) |
+			le_phdr_flags(pkt);
 		pcap_le_packet pcap_pkt;
 		assemble_pcapng_le_packet( &pcap_pkt,
 					   0,
 					   ns,
-					   pkt->length + 4 + 2 + 3, // AA + header + CRC
+					   le_pdu_total_len(pkt), // AA + header + payload + CRC
+					   le_pdu_avail_len(pkt), // ... as far as captured
 					   pkt->channel_k,
 					   sigdbm,
 					   noisedbm,
@@ -386,8 +397,8 @@ lell_pcap_append_ppi_packet(lell_pcap_handle * h, const uint64_t ns,
 			sizeof(ppi_fieldheader_t) +
 			sizeof(ppi_btle_t);
 		uint16_t MHz = 2402 + 2*lell_get_channel_k(pkt);
-		unsigned packet_len = pkt->length + 4 + 2 + 3; // AA + header + CRC
-		unsigned incl_len   = MIN(LE_MAX_PAYLOAD, packet_len);
+		unsigned packet_len = le_pdu_total_len(pkt); // AA + header + payload + CRC
+		unsigned incl_len   = MIN(LE_MAX_PAYLOAD, le_pdu_avail_len(pkt));
 
 		pcap_pkt.pcap_header.ts_sec  = ns / 1000000000ull;
 		pcap_pkt.pcap_header.ts_usec = ns % 1000000000ull;

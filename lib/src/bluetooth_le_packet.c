@@ -27,16 +27,17 @@
 
 #include "btbb.h"
 #include "bluetooth_le_packet.h"
+#include "uthash.h"
 #include <ctype.h>
 #include <string.h>
 
 /* company identifier lookup */
 const char *bt_compidtostr(uint16_t compid);
 
-/* string representations of advertising packet type */
+/* string representations of advertising packet type (primary channels) */
 static const char *ADV_TYPE_NAMES[] = {
 	"ADV_IND", "ADV_DIRECT_IND", "ADV_NONCONN_IND", "SCAN_REQ",
-	"SCAN_RSP", "CONNECT_REQ", "ADV_SCAN_IND",
+	"SCAN_RSP", "CONNECT_IND", "ADV_SCAN_IND", "ADV_EXT_IND",
 };
 
 /* source clock accuracy in a connect packet */
@@ -55,8 +56,71 @@ static const char *FLAGS[] = {
 	"Reserved", "Reserved", "Reserved",
 };
 
+/* LL control PDU opcodes, Core Specification 5.3 Vol 6 Part B 2.4.2 */
+static const char *LL_OPCODE_NAMES[] = {
+	"LL_CONNECTION_UPDATE_IND",	/* 0x00 */
+	"LL_CHANNEL_MAP_IND",		/* 0x01 */
+	"LL_TERMINATE_IND",		/* 0x02 */
+	"LL_ENC_REQ",			/* 0x03 */
+	"LL_ENC_RSP",			/* 0x04 */
+	"LL_START_ENC_REQ",		/* 0x05 */
+	"LL_START_ENC_RSP",		/* 0x06 */
+	"LL_UNKNOWN_RSP",		/* 0x07 */
+	"LL_FEATURE_REQ",		/* 0x08 */
+	"LL_FEATURE_RSP",		/* 0x09 */
+	"LL_PAUSE_ENC_REQ",		/* 0x0A */
+	"LL_PAUSE_ENC_RSP",		/* 0x0B */
+	"LL_VERSION_IND",		/* 0x0C */
+	"LL_REJECT_IND",		/* 0x0D */
+	"LL_PERIPHERAL_FEATURE_REQ",	/* 0x0E */
+	"LL_CONNECTION_PARAM_REQ",	/* 0x0F */
+	"LL_CONNECTION_PARAM_RSP",	/* 0x10 */
+	"LL_REJECT_EXT_IND",		/* 0x11 */
+	"LL_PING_REQ",			/* 0x12 */
+	"LL_PING_RSP",			/* 0x13 */
+	"LL_LENGTH_REQ",		/* 0x14 */
+	"LL_LENGTH_RSP",		/* 0x15 */
+	"LL_PHY_REQ",			/* 0x16 */
+	"LL_PHY_RSP",			/* 0x17 */
+	"LL_PHY_UPDATE_IND",		/* 0x18 */
+	"LL_MIN_USED_CHANNELS_IND",	/* 0x19 */
+	"LL_CTE_REQ",			/* 0x1A */
+	"LL_CTE_RSP",			/* 0x1B */
+	"LL_PERIODIC_SYNC_IND",		/* 0x1C */
+	"LL_CLOCK_ACCURACY_REQ",	/* 0x1D */
+	"LL_CLOCK_ACCURACY_RSP",	/* 0x1E */
+	"LL_CIS_REQ",			/* 0x1F */
+	"LL_CIS_RSP",			/* 0x20 */
+	"LL_CIS_IND",			/* 0x21 */
+	"LL_CIS_TERMINATE_IND",		/* 0x22 */
+	"LL_POWER_CONTROL_REQ",		/* 0x23 */
+	"LL_POWER_CONTROL_RSP",		/* 0x24 */
+	"LL_POWER_CHANGE_IND",		/* 0x25 */
+	"LL_SUBRATE_REQ",		/* 0x26 */
+	"LL_SUBRATE_IND",		/* 0x27 */
+	"LL_CHANNEL_REPORTING_IND",	/* 0x28 */
+	"LL_CHANNEL_STATUS_IND",	/* 0x29 */
+};
+
+static const char *PHY_NAMES[] = { "LE 1M", "LE 2M", "LE Coded", "Reserved" };
+
 // count of objects in an array, shamelessly stolen from Chrome
 #define COUNT_OF(x) ((sizeof(x)/sizeof(0[x])) / ((size_t)(!(sizeof(x) % sizeof(0[x])))))
+
+static uint16_t le16(const uint8_t *b)
+{
+	return (uint16_t) (b[0] | (b[1] << 8));
+}
+
+static uint32_t le24(const uint8_t *b)
+{
+	return (uint32_t) b[0] | ((uint32_t) b[1] << 8) | ((uint32_t) b[2] << 16);
+}
+
+static uint32_t le32(const uint8_t *b)
+{
+	return le24(b) | ((uint32_t) b[3] << 24);
+}
 
 static uint8_t count_bits(uint32_t n)
 {
@@ -73,6 +137,53 @@ static int aa_access_channel_off_by_one(const uint32_t aa) {
 	}
 	return retval;
 }
+
+/* transitions within a byte, given the previous bit was 0 / 1 */
+static const uint8_t EIGHT_BIT_TRANSITIONS_EVEN[256] = {
+	0, 2, 2, 2, 2, 4, 2, 2, 2, 4, 4, 4, 2, 4, 2, 2,
+	2, 4, 4, 4, 4, 6, 4, 4, 2, 4, 4, 4, 2, 4, 2, 2,
+	2, 4, 4, 4, 4, 6, 4, 4, 4, 6, 6, 6, 4, 6, 4, 4,
+	2, 4, 4, 4, 4, 6, 4, 4, 2, 4, 4, 4, 2, 4, 2, 2,
+	2, 4, 4, 4, 4, 6, 4, 4, 4, 6, 6, 6, 4, 6, 4, 4,
+	4, 6, 6, 6, 6, 8, 6, 6, 4, 6, 6, 6, 4, 6, 4, 4,
+	2, 4, 4, 4, 4, 6, 4, 4, 4, 6, 6, 6, 4, 6, 4, 4,
+	2, 4, 4, 4, 4, 6, 4, 4, 2, 4, 4, 4, 2, 4, 2, 2,
+	1, 3, 3, 3, 3, 5, 3, 3, 3, 5, 5, 5, 3, 5, 3, 3,
+	3, 5, 5, 5, 5, 7, 5, 5, 3, 5, 5, 5, 3, 5, 3, 3,
+	3, 5, 5, 5, 5, 7, 5, 5, 5, 7, 7, 7, 5, 7, 5, 5,
+	3, 5, 5, 5, 5, 7, 5, 5, 3, 5, 5, 5, 3, 5, 3, 3,
+	1, 3, 3, 3, 3, 5, 3, 3, 3, 5, 5, 5, 3, 5, 3, 3,
+	3, 5, 5, 5, 5, 7, 5, 5, 3, 5, 5, 5, 3, 5, 3, 3,
+	1, 3, 3, 3, 3, 5, 3, 3, 3, 5, 5, 5, 3, 5, 3, 3,
+	1, 3, 3, 3, 3, 5, 3, 3, 1, 3, 3, 3, 1, 3, 1, 1
+};
+
+static const uint8_t EIGHT_BIT_TRANSITIONS_ODD[256] = {
+	1, 1, 3, 1, 3, 3, 3, 1, 3, 3, 5, 3, 3, 3, 3, 1,
+	3, 3, 5, 3, 5, 5, 5, 3, 3, 3, 5, 3, 3, 3, 3, 1,
+	3, 3, 5, 3, 5, 5, 5, 3, 5, 5, 7, 5, 5, 5, 5, 3,
+	3, 3, 5, 3, 5, 5, 5, 3, 3, 3, 5, 3, 3, 3, 3, 1,
+	3, 3, 5, 3, 5, 5, 5, 3, 5, 5, 7, 5, 5, 5, 5, 3,
+	5, 5, 7, 5, 7, 7, 7, 5, 5, 5, 7, 5, 5, 5, 5, 3,
+	3, 3, 5, 3, 5, 5, 5, 3, 5, 5, 7, 5, 5, 5, 5, 3,
+	3, 3, 5, 3, 5, 5, 5, 3, 3, 3, 5, 3, 3, 3, 3, 1,
+	2, 2, 4, 2, 4, 4, 4, 2, 4, 4, 6, 4, 4, 4, 4, 2,
+	4, 4, 6, 4, 6, 6, 6, 4, 4, 4, 6, 4, 4, 4, 4, 2,
+	4, 4, 6, 4, 6, 6, 6, 4, 6, 6, 8, 6, 6, 6, 6, 4,
+	4, 4, 6, 4, 6, 6, 6, 4, 4, 4, 6, 4, 4, 4, 4, 2,
+	2, 2, 4, 2, 4, 4, 4, 2, 4, 4, 6, 4, 4, 4, 4, 2,
+	4, 4, 6, 4, 6, 6, 6, 4, 4, 4, 6, 4, 4, 4, 4, 2,
+	2, 2, 4, 2, 4, 4, 4, 2, 4, 4, 6, 4, 4, 4, 4, 2,
+	2, 2, 4, 2, 4, 4, 4, 2, 2, 2, 4, 2, 2, 2, 2, 0
+};
+
+/* six most significant bits of the AA with at least two transitions */
+static const uint8_t AA_MSB6_ALLOWED[64] = {
+	0, 0, 1, 0, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 0,
+	1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0,
+	0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+	0, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 0, 1, 0, 0
+};
 
 /*
  * A helper function for filtering bogus packets on data channels.
@@ -102,44 +213,6 @@ static int aa_data_channel_offenses(const uint32_t aa) {
 	unsigned shift, odd = (unsigned) (aa & 1);
 	uint8_t aab3, aab2, aab1, aab0 = (uint8_t) (aa & 0xff);
 
-	const uint8_t EIGHT_BIT_TRANSITIONS_EVEN[256] = {
-		0, 2, 2, 2, 2, 4, 2, 2, 2, 4, 4, 4, 2, 4, 2, 2,
-		2, 4, 4, 4, 4, 6, 4, 4, 2, 4, 4, 4, 2, 4, 2, 2,
-		2, 4, 4, 4, 4, 6, 4, 4, 4, 6, 6, 6, 4, 6, 4, 4,
-		2, 4, 4, 4, 4, 6, 4, 4, 2, 4, 4, 4, 2, 4, 2, 2,
-		2, 4, 4, 4, 4, 6, 4, 4, 4, 6, 6, 6, 4, 6, 4, 4,
-		4, 6, 6, 6, 6, 8, 6, 6, 4, 6, 6, 6, 4, 6, 4, 4,
-		2, 4, 4, 4, 4, 6, 4, 4, 4, 6, 6, 6, 4, 6, 4, 4,
-		2, 4, 4, 4, 4, 6, 4, 4, 2, 4, 4, 4, 2, 4, 2, 2,
-		1, 3, 3, 3, 3, 5, 3, 3, 3, 5, 5, 5, 3, 5, 3, 3,
-		3, 5, 5, 5, 5, 7, 5, 5, 3, 5, 5, 5, 3, 5, 3, 3,
-		3, 5, 5, 5, 5, 7, 5, 5, 5, 7, 7, 7, 5, 7, 5, 5,
-		3, 5, 5, 5, 5, 7, 5, 5, 3, 5, 5, 5, 3, 5, 3, 3,
-		1, 3, 3, 3, 3, 5, 3, 3, 3, 5, 5, 5, 3, 5, 3, 3,
-		3, 5, 5, 5, 5, 7, 5, 5, 3, 5, 5, 5, 3, 5, 3, 3,
-		1, 3, 3, 3, 3, 5, 3, 3, 3, 5, 5, 5, 3, 5, 3, 3,
-		1, 3, 3, 3, 3, 5, 3, 3, 1, 3, 3, 3, 1, 3, 1, 1
-	};
-
-	const uint8_t EIGHT_BIT_TRANSITIONS_ODD[256] = {
-		1, 1, 3, 1, 3, 3, 3, 1, 3, 3, 5, 3, 3, 3, 3, 1,
-		3, 3, 5, 3, 5, 5, 5, 3, 3, 3, 5, 3, 3, 3, 3, 1,
-		3, 3, 5, 3, 5, 5, 5, 3, 5, 5, 7, 5, 5, 5, 5, 3,
-		3, 3, 5, 3, 5, 5, 5, 3, 3, 3, 5, 3, 3, 3, 3, 1,
-		3, 3, 5, 3, 5, 5, 5, 3, 5, 5, 7, 5, 5, 5, 5, 3,
-		5, 5, 7, 5, 7, 7, 7, 5, 5, 5, 7, 5, 5, 5, 5, 3,
-		3, 3, 5, 3, 5, 5, 5, 3, 5, 5, 7, 5, 5, 5, 5, 3,
-		3, 3, 5, 3, 5, 5, 5, 3, 3, 3, 5, 3, 3, 3, 3, 1,
-		2, 2, 4, 2, 4, 4, 4, 2, 4, 4, 6, 4, 4, 4, 4, 2,
-		4, 4, 6, 4, 6, 6, 6, 4, 4, 4, 6, 4, 4, 4, 4, 2,
-		4, 4, 6, 4, 6, 6, 6, 4, 6, 6, 8, 6, 6, 6, 6, 4,
-		4, 4, 6, 4, 6, 6, 6, 4, 4, 4, 6, 4, 4, 4, 4, 2,
-		2, 2, 4, 2, 4, 4, 4, 2, 4, 4, 6, 4, 4, 4, 4, 2,
-		4, 4, 6, 4, 6, 6, 6, 4, 4, 4, 6, 4, 4, 4, 4, 2,
-		2, 2, 4, 2, 4, 4, 4, 2, 4, 4, 6, 4, 4, 4, 4, 2,
-		2, 2, 4, 2, 4, 4, 4, 2, 2, 2, 4, 2, 2, 2, 2, 0
-	};
-
 	transitions += (odd ? EIGHT_BIT_TRANSITIONS_ODD[aab0] : EIGHT_BIT_TRANSITIONS_EVEN[aab0] );
 	odd = (unsigned) (aab0 & 0x80);
 	aab1 = (uint8_t) (aa >> 8);
@@ -155,13 +228,6 @@ static int aa_data_channel_offenses(const uint32_t aa) {
 	if (transitions > 24) {
 		retval += (transitions - 24);
 	}
-
-	const uint8_t AA_MSB6_ALLOWED[64] = {
-		0, 0, 1, 0, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 0,
-		1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0,
-		0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-		0, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 0, 1, 0, 0
-	};
 
 	/* consider excessive transitions in the 6 MSBs as an offense */
 	retval += (1 - AA_MSB6_ALLOWED[aab3>>2]);
@@ -245,7 +311,10 @@ lell_packet *
 lell_packet_new(void)
 {
 	lell_packet *pkt = (lell_packet *)calloc(1, sizeof(lell_packet));
-	pkt->refcount = 1;
+	if (pkt) {
+		pkt->refcount = 1;
+		pkt->header_len = 2;
+	}
 	return pkt;
 }
 
@@ -268,7 +337,7 @@ static uint8_t le_channel_index(uint16_t phys_channel) {
 	if (phys_channel == 2402) {
 		ret = 37;
 	} else if (phys_channel < 2426) { // 0 - 10
-		ret = (phys_channel - 2404) / 2;
+		ret = (phys_channel >= 2404) ? (phys_channel - 2404) / 2 : 0;
 	} else if (phys_channel == 2426) {
 		ret = 38;
 	} else if (phys_channel < 2480) { // 11 - 36
@@ -279,41 +348,77 @@ static uint8_t le_channel_index(uint16_t phys_channel) {
 	return ret;
 }
 
+int lell_allocate_and_decode_len(const uint8_t *stream, size_t len,
+				 uint16_t phys_channel, uint32_t clk100ns,
+				 lell_packet **pkt)
+{
+	lell_packet *p;
+	const uint8_t *s;
+	size_t n;
+
+	if (pkt == NULL)
+		return -1;
+	*pkt = p = lell_packet_new();
+	if (p == NULL)
+		return -1;
+
+	/* bytes not captured stay zero */
+	n = (stream == NULL) ? 0 : (len < MAX_LE_SYMBOLS ? len : MAX_LE_SYMBOLS);
+	if (n)
+		memcpy(p->symbols, stream, n);
+	p->captured_len = (unsigned) n;
+	s = p->symbols;
+
+	p->channel_idx = le_channel_index(phys_channel);
+	p->channel_k = (phys_channel >= 2402) ? (phys_channel - 2402) / 2 : 0;
+	p->clk100ns = clk100ns;
+
+	p->access_address = le32(&s[0]);
+	p->header_len = 2;
+	/* 8 bit Length field: data PDUs since Bluetooth 4.2, advertising
+	 * PDUs since 5.0 */
+	p->length = s[5];
+
+	/* The access address decides: the secondary advertising channels
+	 * (0-36) also carry AUX_* advertising PDUs, which use the
+	 * advertising AA.  An AA one bit away from it can't be a data
+	 * channel AA, so it is an advertising PDU with a bit error.  The
+	 * primary channels (37-39) carry nothing but advertising PDUs. */
+	if (p->channel_idx >= 37 || p->access_address == LE_ADV_AA ||
+	    aa_access_channel_off_by_one(p->access_address)) {
+		// advertising PDU
+		p->flags.as_bits.is_data = 0;
+		p->adv_type = s[4] & 0xf;
+		p->adv_chsel = (s[4] >> 5) & 1;
+		p->adv_tx_add = s[4] & 0x40 ? 1 : 0;
+		p->adv_rx_add = s[4] & 0x80 ? 1 : 0;
+		p->flags.as_bits.access_address_ok = (p->access_address == LE_ADV_AA);
+		p->access_address_offenses = p->flags.as_bits.access_address_ok ? 0 :
+			(aa_access_channel_off_by_one(p->access_address) ? 1 : 32);
+	} else {
+		// data PDU
+		p->flags.as_bits.is_data = 1;
+		p->access_address_offenses = aa_data_channel_offenses(p->access_address);
+		p->flags.as_bits.access_address_ok = p->access_address_offenses ? 0 : 1;
+		/* CP bit: a CTEInfo byte follows the Length byte */
+		if (s[4] & 0x20) {
+			p->flags.as_bits.has_cte_info = 1;
+			p->header_len = 3;
+			p->cte_info = s[6];
+		}
+	}
+	return 0;
+}
+
 void lell_allocate_and_decode(const uint8_t *stream, uint16_t phys_channel, uint32_t clk100ns, lell_packet **pkt)
 {
-	*pkt = lell_packet_new( );
-	memcpy((*pkt)->symbols, stream, MAX_LE_SYMBOLS);
-
-	(*pkt)->channel_idx = le_channel_index(phys_channel);
-	(*pkt)->channel_k = (phys_channel-2402)/2;
-	(*pkt)->clk100ns = clk100ns;
-
-	(*pkt)->access_address = 0;
-	(*pkt)->access_address |= (*pkt)->symbols[0];
-	(*pkt)->access_address |= (*pkt)->symbols[1] << 8;
-	(*pkt)->access_address |= (*pkt)->symbols[2] << 16;
-	(*pkt)->access_address |= (*pkt)->symbols[3] << 24;
-
-	if (lell_packet_is_data(*pkt)) {
-		// data PDU
-		(*pkt)->length = (*pkt)->symbols[5] & 0x1f;
-		(*pkt)->access_address_offenses = aa_data_channel_offenses((*pkt)->access_address);
-		(*pkt)->flags.as_bits.access_address_ok = (*pkt)->access_address_offenses ? 0 : 1;
-	} else {
-		// advertising PDU
-		(*pkt)->length = (*pkt)->symbols[5] & 0x3f;
-		(*pkt)->adv_type = (*pkt)->symbols[4] & 0xf;
-		(*pkt)->adv_tx_add = (*pkt)->symbols[4] & 0x40 ? 1 : 0;
-		(*pkt)->adv_rx_add = (*pkt)->symbols[4] & 0x80 ? 1 : 0;
-		(*pkt)->flags.as_bits.access_address_ok = ((*pkt)->access_address == 0x8e89bed6);
-		(*pkt)->access_address_offenses = (*pkt)->flags.as_bits.access_address_ok ? 0 :
-			(aa_access_channel_off_by_one((*pkt)->access_address) ? 1 : 32);
-	}
+	(void) lell_allocate_and_decode_len(stream, LEGACY_LE_SYMBOLS,
+					    phys_channel, clk100ns, pkt);
 }
 
 unsigned lell_packet_is_data(const lell_packet *pkt)
 {
-	return (unsigned) (pkt->channel_idx < 37);
+	return (unsigned) pkt->flags.as_bits.is_data;
 }
 
 uint32_t lell_get_access_address(const lell_packet *pkt)
@@ -336,43 +441,314 @@ unsigned lell_get_channel_k(const lell_packet *pkt)
 	return pkt->channel_k;
 }
 
+unsigned lell_get_length(const lell_packet *pkt)
+{
+	return (unsigned) pkt->length;
+}
+
+unsigned lell_get_captured_length(const lell_packet *pkt)
+{
+	return pkt->captured_len;
+}
+
+int lell_packet_is_truncated(const lell_packet *pkt)
+{
+	return pkt->captured_len < le_pdu_total_len(pkt);
+}
+
+int lell_get_chsel(const lell_packet *pkt)
+{
+	if (lell_packet_is_data(pkt) || pkt->channel_idx < 37)
+		return -1;
+	switch (pkt->adv_type) {
+	case ADV_IND:
+	case ADV_DIRECT_IND:
+	case CONNECT_IND:
+		return pkt->adv_chsel;
+	default:
+		return -1;
+	}
+}
+
+int lell_get_cte_info(const lell_packet *pkt)
+{
+	if (!lell_packet_is_data(pkt) || !pkt->flags.as_bits.has_cte_info)
+		return -1;
+	return pkt->cte_info;
+}
+
+void lell_packet_set_encrypted(lell_packet *pkt, int encrypted)
+{
+	pkt->flags.as_bits.encrypted = encrypted ? 1 : 0;
+}
+
+int lell_packet_is_encrypted(const lell_packet *pkt)
+{
+	return pkt->flags.as_bits.encrypted;
+}
+
+void lell_packet_set_phy(lell_packet *pkt, int phy)
+{
+	pkt->phy = (uint8_t) (phy & 0x3);
+}
+
 const char * lell_get_adv_type_str(const lell_packet *pkt)
 {
 	if (lell_packet_is_data(pkt))
 		return NULL;
+	if (pkt->channel_idx < 37) {
+		/* secondary advertising channel */
+		switch (pkt->adv_type) {
+		case AUX_SCAN_REQ:	return "AUX_SCAN_REQ";
+		case AUX_CONNECT_REQ:	return "AUX_CONNECT_REQ";
+		case ADV_EXT_IND:	return "AUX_ADV_IND/AUX_CHAIN_IND/AUX_SYNC_IND/AUX_SCAN_RSP";
+		case AUX_CONNECT_RSP:	return "AUX_CONNECT_RSP";
+		default:		return "UNKNOWN";
+		}
+	}
 	if (pkt->adv_type < COUNT_OF(ADV_TYPE_NAMES))
 		return ADV_TYPE_NAMES[pkt->adv_type];
 	return "UNKNOWN";
 }
 
-static void _dump_addr(const char *name, const uint8_t *buf, int offset, int random) {
+const char *lell_get_ll_opcode_str(int opcode)
+{
+	if (opcode >= 0 && (unsigned) opcode < COUNT_OF(LL_OPCODE_NAMES))
+		return LL_OPCODE_NAMES[opcode];
+	return "Reserved for Future Use";
+}
+
+int lell_get_ll_opcode(const lell_packet *pkt)
+{
+	if (!lell_packet_is_data(pkt) || pkt->flags.as_bits.encrypted)
+		return -1;
+	if ((pkt->symbols[4] & 0x3) != 3 || pkt->length < 1 ||
+	    le_payload_avail(pkt) < 1)
+		return -1;
+	return pkt->symbols[le_payload_offset(pkt)];
+}
+
+int lell_get_instant(const lell_packet *pkt, uint16_t *instant)
+{
+	unsigned off; /* offset of Instant within the PDU payload */
+	int opcode = lell_get_ll_opcode(pkt);
+
+	switch (opcode) {
+	case LL_CONNECTION_UPDATE_IND:	off = 1 + 9; break;
+	case LL_CHANNEL_MAP_IND:	off = 1 + 5; break;
+	case LL_PHY_UPDATE_IND:		off = 1 + 2; break;
+	default:			return 0;
+	}
+	if (le_payload_avail(pkt) < off + 2)
+		return 0;
+	if (instant)
+		*instant = le16(&pkt->symbols[le_payload_offset(pkt) + off]);
+	return 1;
+}
+
+void lell_packet_set_direction(lell_packet *pkt, int direction)
+{
+	if (pkt)
+		pkt->direction = (direction == 1 || direction == 2) ? direction : 0;
+}
+
+void lell_packet_set_crc_status(lell_packet *pkt, int checked, int valid)
+{
+	if (pkt)
+		pkt->crc_status = checked ? (valid ? 2 : 1) : 0;
+}
+
+uint16_t le_phdr_flags(const lell_packet *pkt)
+{
+	uint16_t flags = 0;
+	/* PDU type 1: Auxiliary Advertising (advertising PDU on a secondary
+	 * channel); 2/3: data, master to slave / slave to master; 0:
+	 * advertising or data, unspecified direction */
+	if (!lell_packet_is_data(pkt) && pkt->channel_idx < 37)
+		flags |= 1 << 7;
+	else if (lell_packet_is_data(pkt) && pkt->direction)
+		flags |= (uint16_t) ((pkt->direction + 1) << 7);
+	/* CRC checked (0x0400) and valid (0x0800) */
+	if (pkt->crc_status)
+		flags |= 0x0400 | (pkt->crc_status == 2 ? 0x0800 : 0);
+	flags |= (uint16_t) ((pkt->phy & 0x3) << 14);
+	return flags;
+}
+
+/* ------------------------------------------------------------------ */
+/* Extended advertising */
+
+int lell_get_ext_adv_info(const lell_packet *pkt, lell_ext_adv_info *info)
+{
+	const uint8_t *p;
+	unsigned len, avail, ehl, pos, end;
+
+	if (info == NULL)
+		return -1;
+	memset(info, 0, sizeof(*info));
+	if (lell_packet_is_data(pkt) ||
+	    (pkt->adv_type != ADV_EXT_IND && pkt->adv_type != AUX_CONNECT_RSP))
+		return -1;
+
+	p = &pkt->symbols[le_payload_offset(pkt)];
+	len = (unsigned) pkt->length;
+	avail = le_payload_avail(pkt);
+	if (len < 1)
+		return -1;
+	if (avail < 1)
+		return -2;
+
+	ehl = p[0] & 0x3f;
+	info->adv_mode = p[0] >> 6;
+	info->ext_header_len = (uint8_t) ehl;
+	end = 1 + ehl;
+	if (end > len)
+		return -1;
+	if (end > avail)
+		return -2;
+
+	pos = 1;
+	if (ehl > 0) {
+		uint8_t flags = p[pos++];
+		info->ext_header_flags = flags & 0x7f;
+
+#define NEED(n) do { if (pos + (n) > end) return -1; } while (0)
+		if (flags & LELL_EXT_HDR_ADVA) {
+			NEED(6);
+			memcpy(info->adva, &p[pos], 6);
+			info->adva_random = (uint8_t) pkt->adv_tx_add;
+			pos += 6;
+		}
+		if (flags & LELL_EXT_HDR_TARGETA) {
+			NEED(6);
+			memcpy(info->targeta, &p[pos], 6);
+			info->targeta_random = (uint8_t) pkt->adv_rx_add;
+			pos += 6;
+		}
+		if (flags & LELL_EXT_HDR_CTEINFO) {
+			NEED(1);
+			info->cte_info = p[pos];
+			pos += 1;
+		}
+		if (flags & LELL_EXT_HDR_ADI) {
+			uint16_t adi;
+			NEED(2);
+			adi = le16(&p[pos]);
+			info->adi_did = adi & 0x0fff;
+			info->adi_sid = (uint8_t) (adi >> 12);
+			pos += 2;
+		}
+		if (flags & LELL_EXT_HDR_AUXPTR) {
+			uint16_t v;
+			NEED(3);
+			info->aux_ptr.channel_index = p[pos] & 0x3f;
+			info->aux_ptr.clock_accuracy = (p[pos] >> 6) & 1;
+			info->aux_ptr.offset_units = (p[pos] >> 7) & 1;
+			v = le16(&p[pos + 1]);
+			info->aux_ptr.aux_offset = v & 0x1fff;
+			info->aux_ptr.aux_phy = (uint8_t) (v >> 13);
+			info->aux_ptr.aux_offset_us = (uint32_t) info->aux_ptr.aux_offset *
+				(info->aux_ptr.offset_units ? 300 : 30);
+			pos += 3;
+		}
+		if (flags & LELL_EXT_HDR_SYNCINFO) {
+			uint16_t v;
+			NEED(18);
+			v = le16(&p[pos]);
+			info->sync_info.sync_packet_offset = v & 0x1fff;
+			info->sync_info.offset_units = (v >> 13) & 1;
+			info->sync_info.offset_adjust = (v >> 14) & 1;
+			info->sync_info.interval = le16(&p[pos + 2]);
+			memcpy(info->sync_info.chm, &p[pos + 4], 5);
+			info->sync_info.chm[4] &= 0x1f;
+			info->sync_info.sca = p[pos + 8] >> 5;
+			info->sync_info.access_address = le32(&p[pos + 9]);
+			info->sync_info.crc_init = le24(&p[pos + 13]);
+			info->sync_info.event_counter = le16(&p[pos + 16]);
+			pos += 18;
+		}
+		if (flags & LELL_EXT_HDR_TXPOWER) {
+			NEED(1);
+			info->tx_power = (int8_t) p[pos];
+			pos += 1;
+		}
+#undef NEED
+		/* the rest of the extended header is ACAD */
+		info->acad = &p[pos];
+		info->acad_len = (uint8_t) (end - pos);
+	}
+
+	info->adv_data = &p[end];
+	info->adv_data_len = (uint8_t) (len - end);
+	if (end + info->adv_data_len > avail) {
+		info->adv_data_len = (uint8_t) (avail - end);
+		info->truncated = 1;
+	}
+	return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Printing */
+
+static void _print_addr6(const char *name, const uint8_t *a, int random) {
 	int i;
-	printf("    %s%02x", name, buf[offset+5]);
+	printf("    %s%02x", name, a[5]);
 	for (i = 4; i >= 0; --i)
-		printf(":%02x", buf[offset+i]);
+		printf(":%02x", a[i]);
 	printf(" (%s)\n", random ? "random" : "public");
 }
 
-static void _dump_8(const char *name, const uint8_t *buf, int offset) {
+/* The _dump_* helpers print a field at 'offset' of the packet, or note
+ * that it was not captured (lim = number of usable bytes of the packet:
+ * the captured part of header and payload). */
+static void _dump_addr(const char *name, const uint8_t *buf, unsigned lim, unsigned offset, int random) {
+	if (offset + 6 > lim) {
+		printf("    %s(not captured)\n", name);
+		return;
+	}
+	_print_addr6(name, &buf[offset], random);
+}
+
+static void _dump_8(const char *name, const uint8_t *buf, unsigned lim, unsigned offset) {
+	if (offset + 1 > lim) {
+		printf("    %s(not captured)\n", name);
+		return;
+	}
 	printf("    %s%02x (%d)\n", name, buf[offset], buf[offset]);
 }
 
-static void _dump_16(const char *name, const uint8_t *buf, int offset) {
-	uint16_t val = buf[offset+1] << 8 | buf[offset];
+static void _dump_16(const char *name, const uint8_t *buf, unsigned lim, unsigned offset) {
+	uint16_t val;
+	if (offset + 2 > lim) {
+		printf("    %s(not captured)\n", name);
+		return;
+	}
+	val = le16(&buf[offset]);
 	printf("    %s%04x (%d)\n", name, val, val);
 }
 
-static void _dump_24(char *name, const uint8_t *buf, int offset) {
-	uint32_t val = buf[offset+2] << 16 | buf[offset+1] << 8 | buf[offset];
-	printf("    %s%06x\n", name, val);
+static void _dump_24(const char *name, const uint8_t *buf, unsigned lim, unsigned offset) {
+	if (offset + 3 > lim) {
+		printf("    %s(not captured)\n", name);
+		return;
+	}
+	printf("    %s%06x\n", name, le24(&buf[offset]));
 }
 
-static void _dump_32(const char *name, const uint8_t *buf, int offset) {
-	uint32_t val = buf[offset+3] << 24 |
-				   buf[offset+2] << 16 |
-				   buf[offset+1] << 8 |
-				   buf[offset+0];
-	printf("    %s%08x\n", name, val);
+static void _dump_32(const char *name, const uint8_t *buf, unsigned lim, unsigned offset) {
+	if (offset + 4 > lim) {
+		printf("    %s(not captured)\n", name);
+		return;
+	}
+	printf("    %s%08x\n", name, le32(&buf[offset]));
+}
+
+static void _dump_hex(const char *name, const uint8_t *buf, unsigned n) {
+	unsigned i;
+	printf("    %s", name);
+	for (i = 0; i < n; ++i)
+		printf(" %02x", buf[i]);
+	printf("\n");
 }
 
 static void _dump_uuid(const uint8_t *uuid) {
@@ -399,7 +775,6 @@ static void _dump_scan_rsp_data(const uint8_t *buf, int len) {
 	int sublen, i;
 	uint8_t type;
 	uint16_t val;
-	char *cval;
 
 	while (pos < len) {
 		sublen = buf[pos];
@@ -417,6 +792,10 @@ static void _dump_scan_rsp_data(const uint8_t *buf, int len) {
 		switch (type) {
 			case 0x01:
 				printf(" (Flags)\n");
+				if (sublen < 2) {
+					printf("           Wrong length (%d, should be 1)\n", sublen-1);
+					break;
+				}
 				printf("           ");
 				for (i = 0; i < 8; ++i)
 					printf("%d", buf[pos+1] & (1 << (7-i)) ? 1 : 0);
@@ -436,10 +815,11 @@ static void _dump_scan_rsp_data(const uint8_t *buf, int len) {
 				printf(" (16-bit Service UUIDs) \n");
 print16:
 				if ((sublen - 1) % 2 == 0) {
-					for (i = 0; i < sublen - 1; i += 2) {
-						uint16_t *uuid = (uint16_t *)&buf[pos+1+i];
-						printf("           %04x\n", *uuid);
-					}
+					for (i = 0; i < sublen - 1; i += 2)
+						printf("           %04x\n", le16(&buf[pos+1+i]));
+				}
+				else {
+					printf("Wrong length (%d, must be divisible by 2)\n", sublen-1);
 				}
 				break;
 			case 0x06:
@@ -463,8 +843,9 @@ print128:
 					printf("Wrong length (%d, must be divisible by 16)\n", sublen-1);
 				}
 				break;
+			case 0x08:
 			case 0x09:
-				printf(" (Complete Local Name)\n");
+				printf(type == 0x08 ? " (Shortened Local Name)\n" : " (Complete Local Name)\n");
 				printf("           ");
 				for (i = 1; i < sublen; ++i)
 					printf("%c", isprint(buf[pos+i]) ? buf[pos+i] : '.');
@@ -474,8 +855,7 @@ print128:
 				printf(" (Tx Power Level)\n");
 				printf("           ");
 				if (sublen-1 == 1) {
-					cval = (char *)&buf[pos+1];
-					printf("%d dBm\n", *cval);
+					printf("%d dBm\n", (int8_t) buf[pos+1]);
 				} else {
 					printf("Wrong length (%d, should be 1)\n", sublen-1);
 				}
@@ -484,9 +864,9 @@ print128:
 				printf(" (Slave Connection Interval Range)\n");
 				printf("           ");
 				if (sublen-1 == 4) {
-					val = (buf[pos+2] << 8) | buf[pos+1];
+					val = le16(&buf[pos+1]);
 					printf("(%0.2f, ", val * 1.25);
-					val = (buf[pos+4] << 8) | buf[pos+3];
+					val = le16(&buf[pos+3]);
 					printf("%0.2f) ms\n", val * 1.25);
 				}
 				else {
@@ -497,8 +877,8 @@ print128:
 				printf(" (Service Data)\n");
 				printf("           ");
 				if (sublen-1 >= 2) {
-					val = (buf[pos+2] << 8) | buf[pos+1];
-					printf("UUID: %02x", val);
+					val = le16(&buf[pos+1]);
+					printf("UUID: %04x", val);
 					if (sublen-1 > 2) {
 						printf(", Additional:");
 						for (i = 3; i < sublen; ++i)
@@ -514,7 +894,7 @@ print128:
 				printf(" (Manufacturer Specific Data)\n");
 				printf("           ");
 				if (sublen - 1 >= 2) {
-					uint16_t company = (buf[pos+2] << 8) | buf[pos+1];
+					uint16_t company = le16(&buf[pos+1]);
 					printf("Company: %s\n", bt_compidtostr(company));
 					printf("           ");
 					printf("Data:");
@@ -537,11 +917,253 @@ print128:
 	}
 }
 
+static const char *_phy_name(unsigned phy)
+{
+	return PHY_NAMES[phy & 3];
+}
+
+/* bit mask of PHYs (LL_PHY_REQ/RSP/UPDATE_IND) as text */
+static void _print_phys(const char *name, uint8_t mask)
+{
+	printf("    %s0x%02x", name, mask);
+	if (mask == 0)
+		printf(" (no change)");
+	if (mask & 0x01) printf(" LE 1M");
+	if (mask & 0x02) printf(" LE 2M");
+	if (mask & 0x04) printf(" LE Coded");
+	printf("\n");
+}
+
+static const char *_version_name(uint8_t vers)
+{
+	static const char *names[] = {
+		"1.0b", "1.1", "1.2", "2.0", "2.1", "3.0", "4.0", "4.1",
+		"4.2", "5.0", "5.1", "5.2", "5.3", "5.4", "6.0",
+	};
+	return (vers < COUNT_OF(names)) ? names[vers] : "unknown";
+}
+
+static void _dump_cte_info(const char *name, uint8_t cte)
+{
+	static const char *types[] = { "AoA", "AoD 1 us slots", "AoD 2 us slots", "Reserved" };
+	printf("    %s0x%02x (CTETime %u us, CTEType %s)\n", name, cte,
+	       (cte & 0x1f) * 8, types[cte >> 6]);
+}
+
+/* LL control PDU: 'p' points to the opcode, 'avail' bytes were captured */
+static void _dump_ll_control(const uint8_t *p, unsigned avail)
+{
+	int opcode;
+	const uint8_t *c;
+	unsigned n;
+
+	if (avail < 1) {
+		printf("    Opcode: (not captured)\n");
+		return;
+	}
+	opcode = p[0];
+	printf("    Opcode: %d / %s\n", opcode, lell_get_ll_opcode_str(opcode));
+	c = p + 1;	/* CtrData */
+	n = avail - 1;
+
+#define NEED(k) do { if (n < (k)) { printf("    (CtrData not completely captured)\n"); return; } } while (0)
+	switch (opcode) {
+	case 0x00: /* LL_CONNECTION_UPDATE_IND */
+		NEED(11);
+		printf("    WinSize: %u (%.2f ms)\n", c[0], c[0] * 1.25);
+		printf("    WinOffset: %u (%.2f ms)\n", le16(&c[1]), le16(&c[1]) * 1.25);
+		printf("    Interval: %u (%.2f ms)\n", le16(&c[3]), le16(&c[3]) * 1.25);
+		printf("    Latency: %u\n", le16(&c[5]));
+		printf("    Timeout: %u (%u ms)\n", le16(&c[7]), le16(&c[7]) * 10);
+		printf("    Instant: %u\n", le16(&c[9]));
+		break;
+	case 0x01: /* LL_CHANNEL_MAP_IND */
+		NEED(7);
+		printf("    ChM: %02x %02x %02x %02x %02x\n", c[0], c[1], c[2], c[3], c[4]);
+		printf("    Instant: %u\n", le16(&c[5]));
+		break;
+	case 0x02: /* LL_TERMINATE_IND */
+	case 0x0D: /* LL_REJECT_IND */
+		NEED(1);
+		printf("    ErrorCode: 0x%02x\n", c[0]);
+		break;
+	case 0x03: /* LL_ENC_REQ */
+		NEED(22);
+		_dump_hex("Rand:", &c[0], 8);
+		printf("    EDIV: %04x\n", le16(&c[8]));
+		_dump_hex("SKDm:", &c[10], 8);
+		_dump_hex("IVm: ", &c[18], 4);
+		break;
+	case 0x04: /* LL_ENC_RSP */
+		NEED(12);
+		_dump_hex("SKDs:", &c[0], 8);
+		_dump_hex("IVs: ", &c[8], 4);
+		break;
+	case 0x07: /* LL_UNKNOWN_RSP */
+		NEED(1);
+		printf("    UnknownType: 0x%02x (%s)\n", c[0], lell_get_ll_opcode_str(c[0]));
+		break;
+	case 0x08: /* LL_FEATURE_REQ */
+	case 0x09: /* LL_FEATURE_RSP */
+	case 0x0E: /* LL_PERIPHERAL_FEATURE_REQ */
+		NEED(8);
+		printf("    FeatureSet: 0x%08x%08x\n", le32(&c[4]), le32(&c[0]));
+		break;
+	case 0x0C: /* LL_VERSION_IND */
+		NEED(5);
+		printf("    VersNr: %u (Bluetooth %s)\n", c[0], _version_name(c[0]));
+		printf("    CompId: 0x%04x (%s)\n", le16(&c[1]), bt_compidtostr(le16(&c[1])));
+		printf("    SubVersNr: 0x%04x\n", le16(&c[3]));
+		break;
+	case 0x0F: /* LL_CONNECTION_PARAM_REQ */
+	case 0x10: /* LL_CONNECTION_PARAM_RSP */
+		NEED(11);
+		printf("    Interval_Min: %u (%.2f ms)\n", le16(&c[0]), le16(&c[0]) * 1.25);
+		printf("    Interval_Max: %u (%.2f ms)\n", le16(&c[2]), le16(&c[2]) * 1.25);
+		printf("    Latency: %u\n", le16(&c[4]));
+		printf("    Timeout: %u (%u ms)\n", le16(&c[6]), le16(&c[6]) * 10);
+		printf("    PreferredPeriodicity: %u\n", c[8]);
+		printf("    ReferenceConnEventCount: %u\n", le16(&c[9]));
+		break;
+	case 0x11: /* LL_REJECT_EXT_IND */
+		NEED(2);
+		printf("    RejectOpcode: 0x%02x (%s)\n", c[0], lell_get_ll_opcode_str(c[0]));
+		printf("    ErrorCode: 0x%02x\n", c[1]);
+		break;
+	case 0x14: /* LL_LENGTH_REQ */
+	case 0x15: /* LL_LENGTH_RSP */
+		NEED(8);
+		printf("    MaxRxOctets: %u\n", le16(&c[0]));
+		printf("    MaxRxTime: %u us\n", le16(&c[2]));
+		printf("    MaxTxOctets: %u\n", le16(&c[4]));
+		printf("    MaxTxTime: %u us\n", le16(&c[6]));
+		break;
+	case 0x16: /* LL_PHY_REQ */
+	case 0x17: /* LL_PHY_RSP */
+		NEED(2);
+		_print_phys("TX_PHYS: ", c[0]);
+		_print_phys("RX_PHYS: ", c[1]);
+		break;
+	case 0x18: /* LL_PHY_UPDATE_IND */
+		NEED(4);
+		_print_phys("PHY_C_TO_P: ", c[0]);
+		_print_phys("PHY_P_TO_C: ", c[1]);
+		printf("    Instant: %u\n", le16(&c[2]));
+		break;
+	case 0x19: /* LL_MIN_USED_CHANNELS_IND */
+		NEED(2);
+		_print_phys("PHYS: ", c[0]);
+		printf("    MinUsedChannels: %u\n", c[1]);
+		break;
+	default:
+		break;
+	}
+#undef NEED
+}
+
+static void _dump_ext_adv(const lell_packet *pkt)
+{
+	static const char *modes[] = {
+		"Non-connectable, non-scannable", "Connectable",
+		"Scannable", "Reserved",
+	};
+	lell_ext_adv_info info;
+	int rv = lell_get_ext_adv_info(pkt, &info);
+
+	if (rv == -2) {
+		printf("    Extended header not completely captured\n");
+		return;
+	}
+	if (rv < 0) {
+		printf("    Malformed extended advertising payload\n");
+		return;
+	}
+	printf("    AdvMode: %u (%s)\n", info.adv_mode, modes[info.adv_mode & 3]);
+	printf("    Extended Header Length: %u\n", info.ext_header_len);
+	if (info.ext_header_len == 0)
+		printf("    Extended Header: (none)\n");
+	if (info.ext_header_flags & LELL_EXT_HDR_ADVA)
+		_print_addr6("AdvA:  ", info.adva, info.adva_random);
+	if (info.ext_header_flags & LELL_EXT_HDR_TARGETA)
+		_print_addr6("TargetA: ", info.targeta, info.targeta_random);
+	if (info.ext_header_flags & LELL_EXT_HDR_CTEINFO)
+		_dump_cte_info("CTEInfo: ", info.cte_info);
+	if (info.ext_header_flags & LELL_EXT_HDR_ADI)
+		printf("    ADI: DID 0x%03x, SID %u\n", info.adi_did, info.adi_sid);
+	if (info.ext_header_flags & LELL_EXT_HDR_AUXPTR)
+		printf("    AuxPtr: Channel %u, %s, Offset %u us (%u x %u us), CA %s\n",
+		       info.aux_ptr.channel_index, _phy_name(info.aux_ptr.aux_phy),
+		       info.aux_ptr.aux_offset_us, info.aux_ptr.aux_offset,
+		       info.aux_ptr.offset_units ? 300 : 30,
+		       info.aux_ptr.clock_accuracy ? "0-50 ppm" : "51-500 ppm");
+	if (info.ext_header_flags & LELL_EXT_HDR_SYNCINFO) {
+		const lell_sync_info *si = &info.sync_info;
+		printf("    SyncInfo: Offset %u (x %u us%s), Interval %u (%.2f ms)\n",
+		       si->sync_packet_offset, si->offset_units ? 300 : 30,
+		       si->offset_adjust ? ", +2.4576 s" : "",
+		       si->interval, si->interval * 1.25);
+		printf("              ChM %02x %02x %02x %02x %02x, SCA %u (%s)\n",
+		       si->chm[0], si->chm[1], si->chm[2], si->chm[3], si->chm[4],
+		       si->sca, CONNECT_SCA[si->sca & 7]);
+		printf("              AA %08x, CRCInit %06x, Event Counter %u\n",
+		       si->access_address, si->crc_init, si->event_counter);
+	}
+	if (info.ext_header_flags & LELL_EXT_HDR_TXPOWER)
+		printf("    TxPower: %d dBm\n", info.tx_power);
+	if (info.acad_len)
+		_dump_hex("ACAD:", info.acad, info.acad_len);
+	if (info.adv_data_len) {
+		_dump_hex(pkt->adv_type == AUX_CONNECT_RSP ? "Data:" : "AdvData:",
+			  info.adv_data, info.adv_data_len);
+		if (!info.truncated)
+			_dump_scan_rsp_data(info.adv_data, info.adv_data_len);
+	}
+	if (info.truncated)
+		printf("    AdvData truncated by the capture\n");
+}
+
+/* CONNECT_IND / AUX_CONNECT_REQ LLData */
+static void _dump_connect_ind(const lell_packet *pkt, unsigned lim)
+{
+	const uint8_t *s = pkt->symbols;
+	unsigned i;
+
+	_dump_addr("InitA: ", s, lim, 6, pkt->adv_tx_add);
+	_dump_addr("AdvA:  ", s, lim, 12, pkt->adv_rx_add);
+	_dump_32("AA:    ", s, lim, 18);
+	_dump_24("CRCInit: ", s, lim, 22);
+	_dump_8("WinSize: ", s, lim, 25);
+	_dump_16("WinOffset: ", s, lim, 26);
+	_dump_16("Interval: ", s, lim, 28);
+	_dump_16("Latency: ", s, lim, 30);
+	_dump_16("Timeout: ", s, lim, 32);
+
+	if (lim < 40) {
+		printf("    ChM, Hop, SCA: (not captured)\n");
+		return;
+	}
+	printf("    ChM:");
+	for (i = 0; i < 5; ++i)
+		printf(" %02x", s[34+i]);
+	printf("\n");
+
+	printf("    Hop: %d\n", s[39] & 0x1f);
+	printf("    SCA: %d, %s\n", s[39] >> 5, CONNECT_SCA[s[39] >> 5]);
+}
+
 void lell_print(const lell_packet *pkt)
 {
-	int i, opcode;
+	unsigned i;
+	const uint8_t *s = pkt->symbols;
+	unsigned poff = le_payload_offset(pkt);
+	unsigned pavail = le_payload_avail(pkt);
+	unsigned lim = poff + pavail;	/* captured bytes of AA, header, payload */
+	unsigned avail = le_pdu_avail_len(pkt);
+	unsigned total = le_pdu_total_len(pkt);
+	unsigned crc_off;
+
 	if (lell_packet_is_data(pkt)) {
-		int llid = pkt->symbols[4] & 0x3;
+		int llid = s[4] & 0x3;
 		static const char *llid_str[] = {
 			"Reserved",
 			"LL Data PDU / empty or L2CAP continuation",
@@ -554,108 +1176,242 @@ void lell_print(const lell_packet *pkt)
 		       pkt->length);
 		printf("    Channel Index: %d\n", pkt->channel_idx);
 		printf("    LLID: %d / %s\n", llid, llid_str[llid]);
-		printf("    NESN: %d  SN: %d  MD: %d\n", (pkt->symbols[4] >> 2) & 1,
-												 (pkt->symbols[4] >> 3) & 1,
-												 (pkt->symbols[4] >> 4) & 1);
-		switch (llid) {
-		case 3: // LL Control PDU
-			opcode = pkt->symbols[6];
-			static const char *opcode_str[] = {
-				"LL_CONNECTION_UPDATE_REQ",
-				"LL_CHANNEL_MAP_REQ",
-				"LL_TERMINATE_IND",
-				"LL_ENC_REQ",
-				"LL_ENC_RSP",
-				"LL_START_ENC_REQ",
-				"LL_START_ENC_RSP",
-				"LL_UNKNOWN_RSP",
-				"LL_FEATURE_REQ",
-				"LL_FEATURE_RSP",
-				"LL_PAUSE_ENC_REQ",
-				"LL_PAUSE_ENC_RSP",
-				"LL_VERSION_IND",
-				"LL_REJECT_IND",
-				"LL_SLAVE_FEATURE_REQ",
-				"LL_CONNECTION_PARAM_REQ",
-				"LL_CONNECTION_PARAM_RSP",
-				"LL_REJECT_IND_EXT",
-				"LL_PING_REQ",
-				"LL_PING_RSP",
-				"Reserved for Future Use",
-			};
-			printf("    Opcode: %d / %s\n", opcode, opcode_str[(opcode<0x14)?opcode:0x14]);
-			break;
-		default:
-			break;
+		printf("    NESN: %d  SN: %d  MD: %d", (s[4] >> 2) & 1,
+		       (s[4] >> 3) & 1, (s[4] >> 4) & 1);
+		if (pkt->flags.as_bits.has_cte_info)
+			printf("  CP: 1");
+		printf("\n");
+		if (pkt->flags.as_bits.has_cte_info)
+			_dump_cte_info("CTEInfo: ", pkt->cte_info);
+
+		if (pkt->flags.as_bits.encrypted && pkt->length > 0) {
+			printf("    encrypted (MIC = last 4 bytes)\n");
+			if (pkt->length >= 4 && pavail == (unsigned) pkt->length)
+				_dump_hex("MIC:", &s[poff + pkt->length - 4], 4);
+		} else if (llid == 3) {
+			// LL Control PDU
+			_dump_ll_control(&s[poff], pavail);
 		}
 	} else {
-		printf("Advertising / AA %08x (%s)/ %2d bytes\n", pkt->access_address, 
+		int chsel = lell_get_chsel(pkt);
+
+		printf("Advertising / AA %08x (%s)/ %2d bytes\n", pkt->access_address,
 		       pkt->flags.as_bits.access_address_ok ? "valid" : "invalid",
 		       pkt->length);
 		printf("    Channel Index: %d\n", pkt->channel_idx);
 		printf("    Type:  %s\n", lell_get_adv_type_str(pkt));
+		if (chsel >= 0)
+			printf("    ChSel: %d (Channel Selection Algorithm #%d)\n",
+			       chsel, chsel ? 2 : 1);
 
-		switch(pkt->adv_type) {
-			case ADV_IND:
-			case ADV_NONCONN_IND:
-			case ADV_SCAN_IND:
-				_dump_addr("AdvA:  ", pkt->symbols, 6, pkt->adv_tx_add);
-				if (pkt->length-6 > 0) {
-					printf("    AdvData:");
-					for (i = 0; i < pkt->length - 6; ++i)
-						printf(" %02x", pkt->symbols[12+i]);
-					printf("\n");
-					_dump_scan_rsp_data(&pkt->symbols[12], pkt->length-6);
-				}
-				break;
-			case ADV_DIRECT_IND:
-				_dump_addr("AdvA:  ", pkt->symbols, 6, pkt->adv_tx_add);
-				_dump_addr("InitA: ", pkt->symbols, 12, pkt->adv_rx_add);
-				break;
-			case SCAN_REQ:
-				_dump_addr("ScanA: ", pkt->symbols, 6, pkt->adv_tx_add);
-				_dump_addr("AdvA:  ", pkt->symbols, 12, pkt->adv_rx_add);
-				break;
-			case SCAN_RSP:
-				_dump_addr("AdvA:  ", pkt->symbols, 6, pkt->adv_tx_add);
-				printf("    ScanRspData:");
-				for (i = 0; i < pkt->length - 6; ++i)
-					printf(" %02x", pkt->symbols[12+i]);
-				printf("\n");
-				_dump_scan_rsp_data(&pkt->symbols[12], pkt->length-6);
-				break;
-			case CONNECT_REQ:
-				_dump_addr("InitA: ", pkt->symbols, 6, pkt->adv_tx_add);
-				_dump_addr("AdvA:  ", pkt->symbols, 12, pkt->adv_rx_add);
-				_dump_32("AA:    ", pkt->symbols, 18);
-				_dump_24("CRCInit: ", pkt->symbols, 22);
-				_dump_8("WinSize: ", pkt->symbols, 25);
-				_dump_16("WinOffset: ", pkt->symbols, 26);
-				_dump_16("Interval: ", pkt->symbols, 28);
-				_dump_16("Latency: ", pkt->symbols, 30);
-				_dump_16("Timeout: ", pkt->symbols, 32);
-
-				printf("    ChM:");
-				for (i = 0; i < 5; ++i)
-					printf(" %02x", pkt->symbols[34+i]);
-				printf("\n");
-
-				printf("    Hop: %d\n", pkt->symbols[39] & 0x1f);
-				printf("    SCA: %d, %s\n",
-						pkt->symbols[39] >> 5,
-						CONNECT_SCA[pkt->symbols[39] >> 5]);
-				break;
+		if (pkt->channel_idx < 37) {
+			/* secondary advertising channel */
+			switch (pkt->adv_type) {
+				case AUX_SCAN_REQ:
+					_dump_addr("ScanA: ", s, lim, 6, pkt->adv_tx_add);
+					_dump_addr("AdvA:  ", s, lim, 12, pkt->adv_rx_add);
+					break;
+				case AUX_CONNECT_REQ:
+					_dump_connect_ind(pkt, lim);
+					break;
+				case ADV_EXT_IND:
+				case AUX_CONNECT_RSP:
+					_dump_ext_adv(pkt);
+					break;
+			}
+		} else {
+			switch(pkt->adv_type) {
+				case ADV_IND:
+				case ADV_NONCONN_IND:
+				case ADV_SCAN_IND:
+					_dump_addr("AdvA:  ", s, lim, 6, pkt->adv_tx_add);
+					if (lim > 12) {
+						_dump_hex("AdvData:", &s[12], lim - 12);
+						_dump_scan_rsp_data(&s[12], lim - 12);
+					}
+					break;
+				case ADV_DIRECT_IND:
+					_dump_addr("AdvA:  ", s, lim, 6, pkt->adv_tx_add);
+					_dump_addr("InitA: ", s, lim, 12, pkt->adv_rx_add);
+					break;
+				case SCAN_REQ:
+					_dump_addr("ScanA: ", s, lim, 6, pkt->adv_tx_add);
+					_dump_addr("AdvA:  ", s, lim, 12, pkt->adv_rx_add);
+					break;
+				case SCAN_RSP:
+					_dump_addr("AdvA:  ", s, lim, 6, pkt->adv_tx_add);
+					_dump_hex("ScanRspData:", &s[12], lim > 12 ? lim - 12 : 0);
+					if (lim > 12)
+						_dump_scan_rsp_data(&s[12], lim - 12);
+					break;
+				case CONNECT_IND:
+					_dump_connect_ind(pkt, lim);
+					break;
+				case ADV_EXT_IND:
+					_dump_ext_adv(pkt);
+					break;
+			}
 		}
 	}
 
 	printf("\n");
 	printf("    Data: ");
-	for (i = 6; i < 6 + pkt->length; ++i)
-		printf(" %02x", pkt->symbols[i]);
+	for (i = poff; i < lim; ++i)
+		printf(" %02x", s[i]);
 	printf("\n");
 
 	printf("    CRC:  ");
-	for (i = 0; i < 3; ++i)
-		printf(" %02x", pkt->symbols[6 + pkt->length + i]);
+	crc_off = poff + pkt->length;
+	for (i = 0; i < 3 && crc_off + i < avail; ++i)
+		printf(" %02x", s[crc_off + i]);
 	printf("\n");
+
+	if (avail < total)
+		printf("    Truncated: %u of %u bytes captured\n", avail, total);
+}
+
+/* ------------------------------------------------------------------ */
+/* Encryption tracking */
+
+/* bound on the number of tracked connections */
+#define LELL_TRACKER_MAX_CONNS 4096
+
+typedef struct {
+	uint32_t aa;		/* key */
+	uint8_t encrypted;
+	UT_hash_handle hh;
+} lell_conn;
+
+struct lell_tracker {
+	lell_conn *conns;
+	unsigned count;
+};
+
+lell_tracker *lell_tracker_new(void)
+{
+	return (lell_tracker *) calloc(1, sizeof(lell_tracker));
+}
+
+static void tracker_clear(lell_tracker *t)
+{
+	lell_conn *c, *tmp;
+	HASH_ITER(hh, t->conns, c, tmp) {
+		HASH_DEL(t->conns, c);
+		free(c);
+	}
+	t->count = 0;
+}
+
+void lell_tracker_free(lell_tracker *tracker)
+{
+	if (!tracker)
+		return;
+	tracker_clear(tracker);
+	free(tracker);
+}
+
+static lell_conn *tracker_find(lell_tracker *t, uint32_t aa)
+{
+	lell_conn *c;
+	HASH_FIND(hh, t->conns, &aa, sizeof(aa), c);
+	return c;
+}
+
+static lell_conn *tracker_get(lell_tracker *t, uint32_t aa)
+{
+	lell_conn *c = tracker_find(t, aa);
+	if (c)
+		return c;
+	if (t->count >= LELL_TRACKER_MAX_CONNS)
+		tracker_clear(t);
+	c = (lell_conn *) calloc(1, sizeof(lell_conn));
+	if (!c)
+		return NULL;
+	c->aa = aa;
+	HASH_ADD(hh, t->conns, aa, sizeof(c->aa), c);
+	t->count++;
+	return c;
+}
+
+static void tracker_del(lell_tracker *t, lell_conn *c)
+{
+	HASH_DEL(t->conns, c);
+	free(c);
+	t->count--;
+}
+
+void lell_track(lell_tracker *t, lell_packet *pkt)
+{
+	lell_conn *c;
+	unsigned poff, pavail;
+	int llid, opcode;
+
+	if (!t || !pkt)
+		return;
+
+	if (!lell_packet_is_data(pkt)) {
+		/* CONNECT_IND (or AUX_CONNECT_REQ): a new connection with this
+		 * AA starts unencrypted */
+		if (pkt->adv_type == CONNECT_IND && pkt->length == 34 &&
+		    pkt->flags.as_bits.access_address_ok &&
+		    le_payload_avail(pkt) >= 16) {
+			uint32_t aa = le32(&pkt->symbols[6 + 12]);
+			c = tracker_get(t, aa);
+			if (c)
+				c->encrypted = 0;
+		}
+		return;
+	}
+
+	/* empty PDUs are never encrypted */
+	if (pkt->length == 0)
+		return;
+
+	c = tracker_find(t, pkt->access_address);
+
+	/* the caller (e.g. the capture firmware) knows best */
+	if (pkt->flags.as_bits.encrypted) {
+		if (!c)
+			c = tracker_get(t, pkt->access_address);
+		if (c)
+			c->encrypted = 1;
+		return;
+	}
+
+	llid = pkt->symbols[4] & 0x3;
+	poff = le_payload_offset(pkt);
+	pavail = le_payload_avail(pkt);
+	opcode = (llid == 3 && pavail >= 1) ? pkt->symbols[poff] : -1;
+
+	if (c && c->encrypted) {
+		/* An encrypted PDU carries at least 1 byte of payload plus
+		 * a 4 byte MIC; a shorter one is plaintext. */
+		if (pkt->length >= 5) {
+			pkt->flags.as_bits.encrypted = 1;
+			return;
+		}
+		/* The central's LL_PAUSE_ENC_RSP is sent unencrypted and
+		 * ends encryption (until the next LL_START_ENC_REQ). */
+		if (opcode == LL_PAUSE_ENC_RSP)
+			c->encrypted = 0;
+		return;
+	}
+
+	switch (opcode) {
+	case LL_START_ENC_REQ:
+		/* last unencrypted PDU: the LL_START_ENC_RSPs and everything
+		 * after them are encrypted */
+		if (!c)
+			c = tracker_get(t, pkt->access_address);
+		if (c)
+			c->encrypted = 1;
+		break;
+	case LL_TERMINATE_IND:
+		/* unencrypted connection terminated */
+		if (c)
+			tracker_del(t, c);
+		break;
+	default:
+		break;
+	}
 }

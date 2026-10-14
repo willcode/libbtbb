@@ -1,0 +1,10 @@
+/* Exported symbols of libbtbb.so: the public API declared in btbb.h,
+ * plus bt_compidtostr() which existing tools link against. */
+{
+	global:
+		btbb_*;
+		lell_*;
+		bt_compidtostr;
+	local:
+		*;
+};

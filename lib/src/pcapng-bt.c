@@ -106,10 +106,10 @@ create_bredr_capture_file_single_interface( PCAPNG_HANDLE * handle,
 
 	retval = pcapng_create( handle,
 				filename,
-				(const option_header *) &libbtbb_section_options, 
+				(const option_header *) &libbtbb_section_options,
 				(size_t) getpagesize( ),
 				DLT_BLUETOOTH_BREDR_BB,
-				BREDR_MAX_PAYLOAD,
+				sizeof(pcap_bluetooth_bredr_bb_header),
 				interface_options,
 				(size_t) getpagesize( ) );
 
@@ -134,9 +134,13 @@ int btbb_pcapng_create_file( const char *filename,
 	PCAPNG_HANDLE * handle = malloc( sizeof(PCAPNG_HANDLE) );
 	if (handle) {
 		const option_header * popt = NULL;
-		struct {
+		/* option list: description followed by opt_endofopt, so
+		 * walking the list never runs past the end of the struct
+		 * (a 253-255 character description pads to 256 bytes) */
+		struct __attribute__((packed)) {
 			option_header header;
 			char desc[256];
+			option_header end;
 		} ifopt = {
 			.header = {
 				.option_code = IF_DESCRIPTION,
@@ -196,7 +200,7 @@ assemble_pcapng_bredr_packet( pcapng_bredr_packet * pkt,
 				 - sizeof(pkt->bredr_bb_header.bredr_payload)  
 				 + caplen;
 	uint32_t block_length  = 4*((36+pcapng_caplen+3)/4);
-	uint32_t reflapuap = (ref_lap&0xffffff) | (ref_uap<<24);
+	uint32_t reflapuap = (ref_lap&0xffffff) | ((uint32_t)ref_uap<<24);
 
 	pkt->blk_header.block_type = BLOCK_TYPE_ENHANCED_PACKET;
 	pkt->blk_header.block_total_length = block_length;
@@ -225,6 +229,9 @@ assemble_pcapng_bredr_packet( pcapng_bredr_packet * pkt,
 	else {
 		pkt->bredr_bb_header.flags &= htole16( ~BREDR_PAYLOAD_PRESENT );
 	}
+	/* zero the alignment padding so no stack garbage reaches the file */
+	(void) memset( (uint8_t *)pkt + sizeof(enhanced_packet_block) + pcapng_caplen, 0,
+		       block_length - 8 - sizeof(enhanced_packet_block) - pcapng_caplen );
 	((uint32_t *)pkt)[block_length/4-2] = 0x00000000; /* no-options */
 	((uint32_t *)pkt)[block_length/4-1] = block_length;
 }
@@ -239,10 +246,14 @@ int btbb_pcapng_append_packet(btbb_pcapng_handle * h, const uint64_t ns,
 		((reflap != LAP_ANY) ? BREDR_REFLAP_VALID : 0) |
 		((refuap != UAP_ANY) ? BREDR_REFUAP_VALID : 0);
 	int caplen = btbb_packet_get_payload_length(pkt);
-	char payload_bytes[caplen];
-	btbb_get_payload_packed( pkt, &payload_bytes[0] );
-	caplen = MIN(BREDR_MAX_PAYLOAD, caplen);
+	/* payload_length never exceeds the payload buffer of the packet */
+	char payload_bytes[MAX_PAYLOAD_LENGTH / 8];
 	pcapng_bredr_packet pcapng_pkt;
+	if (caplen < 0 || caplen > (int) sizeof(payload_bytes))
+		caplen = 0;
+	if (caplen)
+		btbb_get_payload_packed( pkt, &payload_bytes[0] );
+	caplen = MIN(BREDR_MAX_PAYLOAD, caplen);
 	assemble_pcapng_bredr_packet( &pcapng_pkt,
 				      0,
 				      ns,
@@ -273,7 +284,8 @@ record_bd_addr_info( PCAPNG_HANDLE * handle,
 	const bredr_br_addr_option bdopt = {
 		.header = {
 			.option_code = PCAPNG_BREDR_OPTION_BD_ADDR,
-			.option_length = sizeof(bredr_br_addr_option),
+			/* option length excludes the option header */
+			.option_length = sizeof(bredr_bd_addr_info),
 		},
 		.bd_addr_info = {
 			.bd_addr = {
@@ -309,13 +321,14 @@ record_bredr_master_clock_info( PCAPNG_HANDLE * handle,
 	const bredr_clk_option mcopt = {
 		.header = {
 			.option_code = PCAPNG_BREDR_OPTION_MASTER_CLOCK_INFO,
-			.option_length = sizeof(bredr_clk_option)
+			/* option length excludes the option header */
+			.option_length = sizeof(bredr_clk_info)
 		},
 		.clock_info = {
-			.ts = ns,
+			.ts = htole64(ns),
 			.lap_uap = htole32(bd_addr & 0xffffffff),
-			.clk = clk,
-			.clk_mask = clk_mask
+			.clk = htole32(clk),
+			.clk_mask = htole32(clk_mask)
 		}
 	};
 	return pcapng_append_interface_option( handle,
@@ -332,11 +345,12 @@ int btbb_pcapng_record_btclock(btbb_pcapng_handle * h, const uint64_t bdaddr,
 
 int btbb_pcapng_close(btbb_pcapng_handle * h)
 {
-	pcapng_close( (PCAPNG_HANDLE *) h );
-	if (h) {
-		free( h );
-	}
-	return -PCAPNG_INVALID_HANDLE;
+	int retval;
+	if (!h)
+		return -PCAPNG_INVALID_HANDLE;
+	retval = -pcapng_close( (PCAPNG_HANDLE *) h );
+	free( h );
+	return retval;
 }
 
 /* --------------------------------- Low Energy ---------------------------- */
@@ -353,7 +367,7 @@ create_le_capture_file_single_interface( PCAPNG_HANDLE * handle,
 				(const option_header *) &libbtbb_section_options, 
 				(size_t) getpagesize( ),
 				DLT_BLUETOOTH_LE_LL_WITH_PHDR,
-				64,
+				sizeof(pcap_bluetooth_le_ll_header) + LE_MAX_PAYLOAD,
 				interface_options,
 				(size_t) getpagesize( ) );
 
@@ -378,9 +392,13 @@ lell_pcapng_create_file(const char *filename, const char *interface_desc,
 	PCAPNG_HANDLE * handle = malloc( sizeof(PCAPNG_HANDLE) );
 	if (handle) {
 		const option_header * popt = NULL;
-		struct {
+		/* option list: description followed by opt_endofopt, so
+		 * walking the list never runs past the end of the struct
+		 * (a 253-255 character description pads to 256 bytes) */
+		struct __attribute__((packed)) {
 			option_header header;
 			char desc[256];
+			option_header end;
 		} ifopt = {
 			.header = {
 				.option_code = IF_DESCRIPTION,
@@ -425,7 +443,8 @@ static void
 assemble_pcapng_le_packet( pcapng_le_packet * pkt,
 			   const uint32_t interface_id,
 			   const uint64_t ns,
-			   const uint32_t caplen,
+			   uint32_t caplen,          /* bytes captured */
+			   const uint32_t origlen,   /* length on the air */
 			   const uint8_t rf_channel,
 			   const int8_t signal_power,
 			   const int8_t noise_power,
@@ -434,11 +453,12 @@ assemble_pcapng_le_packet( pcapng_le_packet * pkt,
 			   const uint16_t flags,
 			   const uint8_t * lepkt )
 {
-	uint32_t pcapng_caplen = sizeof(pcap_bluetooth_le_ll_header)+caplen;
-	uint32_t block_length  = 4*((PCAPNG_ENHANCED_BLK_SZ+pcapng_caplen+3)/4);
+	uint32_t pcapng_caplen, block_length;
 
-	// TODO this should never happen, but handle it if it does
-	assert(caplen <= LE_MAX_PAYLOAD);
+	if (caplen > LE_MAX_PAYLOAD)
+		caplen = LE_MAX_PAYLOAD;
+	pcapng_caplen = sizeof(pcap_bluetooth_le_ll_header)+caplen;
+	block_length  = 4*((PCAPNG_ENHANCED_BLK_SZ+pcapng_caplen+3)/4);
 
 	pkt->blk_header.block_type = BLOCK_TYPE_ENHANCED_PACKET;
 	pkt->blk_header.block_total_length = block_length;
@@ -446,7 +466,8 @@ assemble_pcapng_le_packet( pcapng_le_packet * pkt,
 	pkt->blk_header.timestamp_high = (uint32_t) (ns >> 32);
 	pkt->blk_header.timestamp_low = (uint32_t) (ns & 0x0ffffffffull);
 	pkt->blk_header.captured_len = pcapng_caplen;
-	pkt->blk_header.packet_len = pcapng_caplen;
+	pkt->blk_header.packet_len = sizeof(pcap_bluetooth_le_ll_header) +
+		(origlen > caplen ? origlen : caplen);
 	pkt->le_ll_header.rf_channel = rf_channel;
 	pkt->le_ll_header.signal_power = signal_power;
 	pkt->le_ll_header.noise_power = noise_power;
@@ -454,6 +475,9 @@ assemble_pcapng_le_packet( pcapng_le_packet * pkt,
 	pkt->le_ll_header.ref_access_address = htole32( ref_access_address );
 	pkt->le_ll_header.flags = htole16( flags );
 	(void) memcpy( &pkt->le_packet[0], lepkt, caplen );
+	/* zero the alignment padding so no stack garbage reaches the file */
+	(void) memset( (uint8_t *)pkt + sizeof(enhanced_packet_block) + pcapng_caplen, 0,
+		       block_length - 8 - sizeof(enhanced_packet_block) - pcapng_caplen );
 	((uint32_t *)pkt)[block_length/4-2] = 0x00000000; /* no-options */
 	((uint32_t *)pkt)[block_length/4-1] = block_length;
 }
@@ -466,17 +490,17 @@ lell_pcapng_append_packet(lell_pcapng_handle * h, const uint64_t ns,
 	uint16_t flags = LE_DEWHITENED | LE_AA_OFFENSES_VALID |
 		LE_SIGPOWER_VALID |
 		((noisedbm < sigdbm) ? LE_NOISEPOWER_VALID : 0) |
-		(lell_packet_is_data(pkt) ? 0 : LE_REF_AA_VALID);
+		(lell_packet_is_data(pkt) ? 0 : LE_REF_AA_VALID) |
+		le_phdr_flags(pkt);
 	pcapng_le_packet pcapng_pkt;
 
-	/* The extra 9 bytes added to the packet length are for:
-	   4 bytes for Access Address
-	   2 bytes for PDU header
-	   3 bytes for CRC */
+	/* The packet is the Access Address (4), PDU header (2, or 3 with
+	   CTEInfo), payload and CRC (3), as far as it was captured. */
 	assemble_pcapng_le_packet( &pcapng_pkt,
 				   0,
 				   ns,
-				   9+pkt->length,
+				   le_pdu_avail_len(pkt),
+				   le_pdu_total_len(pkt),
 				   pkt->channel_k,
 				   sigdbm,
 				   noisedbm,
@@ -485,8 +509,15 @@ lell_pcapng_append_packet(lell_pcapng_handle * h, const uint64_t ns,
 				   flags,
 				   &pkt->symbols[0] );
 	int retval = -append_le_packet( (PCAPNG_HANDLE *) h, &pcapng_pkt );
-	if ((retval == 0) && !lell_packet_is_data(pkt) && (pkt->adv_type == CONNECT_REQ)) {
-		(void) lell_pcapng_record_connect_req(h, ns, &pkt->symbols[0]);
+	/* Record the connection parameters of plausible CONNECT_INDs only
+	 * (valid advertising AA, correct length).  The options live in the
+	 * fixed size interface description block; once it is full further
+	 * connections are simply not recorded. */
+	if ((retval == 0) && !lell_packet_is_data(pkt) &&
+	    (pkt->adv_type == CONNECT_REQ) && (pkt->length == 34) &&
+	    pkt->flags.as_bits.access_address_ok) {
+		/* LLData (InitA, AdvA, AA, ...) starts after AA and header */
+		(void) lell_pcapng_record_connect_req(h, ns, &pkt->symbols[6]);
 	}
 	return retval;
 }
@@ -499,12 +530,15 @@ record_le_connect_req_info( PCAPNG_HANDLE * handle,
 	le_ll_connection_info_option cropt = {
 		.header = {
 			.option_code = PCAPNG_LE_LL_CONNECTION_INFO,
-			.option_length = sizeof(le_ll_connection_info_option)
+			/* option length excludes the option header */
+			.option_length = sizeof(le_ll_connection_info)
 		},
 		.connection_info = {
-			.ns = ns
+			.ns = htole64(ns)
 		}
 	};
+	if (!pdu)
+		return PCAPNG_INVALID_HANDLE;
 	(void) memcpy( &cropt.connection_info.pdu.bytes[0], pdu, 34 );
 	return pcapng_append_interface_option( handle,
 					       (const option_header *) &cropt );
@@ -519,9 +553,10 @@ lell_pcapng_record_connect_req(lell_pcapng_handle * h, const uint64_t ns,
 
 int lell_pcapng_close(lell_pcapng_handle *h)
 {
-	pcapng_close( (PCAPNG_HANDLE *) h );
-	if (h) {
-		free( h );
-	}
-	return -PCAPNG_INVALID_HANDLE;
+	int retval;
+	if (!h)
+		return -PCAPNG_INVALID_HANDLE;
+	retval = -pcapng_close( (PCAPNG_HANDLE *) h );
+	free( h );
+	return retval;
 }
