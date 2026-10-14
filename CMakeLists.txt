@@ -20,8 +20,12 @@
 #
 #top level cmake project for libbtbb lib + tools
 
-cmake_minimum_required(VERSION 2.8)
-project(libbtbb_all)
+cmake_minimum_required(VERSION 3.13...3.31)
+project(libbtbb_all VERSION 1.1 LANGUAGES C)
+
+# Version used for the Python helper packages (must be PEP 440 compliant).
+# Subdirectories inherit it; project() calls in subdirectories do not reset it.
+set(PACKAGE_VERSION ${PROJECT_VERSION})
 set(CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake/modules)
 
 set(INSTALL_DEFAULT_BINDIR "bin" CACHE STRING "Appended to CMAKE_INSTALL_PREFIX")

@@ -17,6 +17,12 @@
 # the Free Software Foundation, Inc., 51 Franklin Street,
 # Boston, MA 02110-1301, USA.
 
+# PACKAGE_VERSION is normally provided by the top-level CMakeLists.txt; fall
+# back to a valid PEP 440 version for standalone builds of this directory.
+if(NOT PACKAGE_VERSION)
+	set(PACKAGE_VERSION "1.1")
+endif()
+
 set(SETUP_PY_IN ${CMAKE_CURRENT_SOURCE_DIR}/setup.py.in)
 set(SETUP_PY    ${CMAKE_CURRENT_BINARY_DIR}/setup.py)
 set(DEPS        ${CMAKE_CURRENT_SOURCE_DIR}/pcapdump/__init__.py
@@ -26,12 +32,26 @@ set(OUTPUT      ${CMAKE_CURRENT_BINARY_DIR}/build)
 configure_file(${SETUP_PY_IN} ${SETUP_PY})
 
 add_custom_command(OUTPUT ${OUTPUT}/timestamp
-                   COMMAND ${Python3_EXECUTABLE} setup.py build
+                   COMMAND ${Python3_EXECUTABLE} ${SETUP_PY}
+                           egg_info --egg-base ${CMAKE_CURRENT_BINARY_DIR}
+                           build -b ${OUTPUT}
                    COMMAND ${CMAKE_COMMAND} -E touch ${OUTPUT}/timestamp
-                   DEPENDS ${DEPS})
+                   DEPENDS ${DEPS} ${SETUP_PY_IN}
+                   WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 
 add_custom_target(pcapdump ALL DEPENDS ${OUTPUT}/timestamp)
-install(CODE "execute_process(COMMAND ${PYTHON_EXECUTABLE} ${SETUP_PY} build -b ${OUTPUT} install --prefix=${BUILD_ROOT}/${CMAKE_INSTALL_PREFIX})")
+# Honour DESTDIR for staged installs; fail the install if setup.py fails.
+install(CODE "
+execute_process(COMMAND ${Python3_EXECUTABLE} ${SETUP_PY}
+                        egg_info --egg-base ${CMAKE_CURRENT_BINARY_DIR}
+                        build -b ${OUTPUT}
+                        install --prefix=${CMAKE_INSTALL_PREFIX} --root=\$ENV{DESTDIR}/
+                WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+                RESULT_VARIABLE _pcapdump_rv)
+if(NOT _pcapdump_rv EQUAL 0)
+	message(FATAL_ERROR \"pcapdump install failed: \${_pcapdump_rv}\")
+endif()
+")
 
 add_custom_target(btaptap ALL DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/btaptap)
 install(PROGRAMS btaptap DESTINATION ${INSTALL_DEFAULT_BINDIR})

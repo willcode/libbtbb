@@ -21,11 +21,17 @@
 
 include(GNUInstallDirs)
 
+# Backwards compatibility: honour the historical LIB_SUFFIX (e.g. -DLIB_SUFFIX=64)
+# by mapping it onto the GNUInstallDirs library directory.
+if(DEFINED LIB_SUFFIX AND NOT "${LIB_SUFFIX}" STREQUAL "")
+	set(CMAKE_INSTALL_LIBDIR "lib${LIB_SUFFIX}")
+endif()
+
 # Based heavily upon the hackrf cmake setup.
 
 project(libbtbb C)
 set(MAJOR_VERSION 1)
-set(MINOR_VERSION 0)
+set(MINOR_VERSION 1)
 set(PACKAGE libbtbb)
 set(VERSION ${MAJOR_VERSION}.${MINOR_VERSION})
 add_definitions( -DVERSION="${VERSION}" )
@@ -44,5 +50,5 @@ CONFIGURE_FILE(
 
 INSTALL(
     FILES ${CMAKE_CURRENT_BINARY_DIR}/libbtbb.pc
-    DESTINATION lib${LIB_SUFFIX}/pkgconfig
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig
 )
