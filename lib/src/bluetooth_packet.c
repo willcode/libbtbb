@@ -24,7 +24,6 @@
 #include <stdlib.h>
 
 #include "bluetooth_packet.h"
-#include "uthash.h"
 #include "sw_check_tables.h"
 
 #define MIN(X, Y) (((X) < (Y)) ? (X) : (Y))
@@ -118,30 +117,75 @@ static const uint16_t fec23_gen_matrix[] = {
 	0x2c01, 0x5802, 0x1c04, 0x3808, 0x7010,
 	0x4c20, 0x3440, 0x6880, 0x7d00, 0x5600};
 
+/* Syndrome -> error pattern table for access code error correction.
+ *
+ * A flat open-addressing (linear probing) hash table allocated in one
+ * block.  For max_ac_errors = 5 there are sum(C(58,k), k=1..5) ~ 5.04M
+ * entries; this needs 128 MiB instead of ~5M individually malloc'd
+ * uthash nodes (~0.5 GB).  A syndrome of 0 marks an empty slot: no
+ * correctable error pattern has a zero syndrome (the code's minimum
+ * distance is far larger than AC_ERROR_LIMIT). */
 typedef struct {
-    uint64_t syndrome; /* key */
-    uint64_t error;
-    UT_hash_handle hh;
+	uint64_t syndrome; /* key, 0 = empty */
+	uint64_t error;
 } syndrome_struct;
 
 static syndrome_struct *syndrome_map = NULL;
+static uint64_t syndrome_map_mask = 0;     /* table size - 1 (power of 2) */
+static int syndrome_map_errors = 0;        /* max_ac_errors the table covers */
+
+/* A bitmap of the table's syndromes (about 32 bits per entry) rejects almost
+ * every random window before the hash table is touched. */
+static uint64_t *syndrome_bits = NULL;
+static uint64_t syndrome_bits_mask = 0;    /* bitmap size in bits - 1 */
+
+static inline uint64_t syndrome_bit(uint64_t syndrome)
+{
+	return (syndrome ^ (syndrome >> 29)) & syndrome_bits_mask;
+}
+
+static uint64_t syndrome_hash(uint64_t x)
+{
+	/* 64-bit finalizer from MurmurHash3 */
+	x ^= x >> 33;
+	x *= 0xff51afd7ed558ccdULL;
+	x ^= x >> 33;
+	x *= 0xc4ceb9fe1a85ec53ULL;
+	x ^= x >> 33;
+	return x;
+}
 
 static void add_syndrome(uint64_t syndrome, uint64_t error)
 {
-	syndrome_struct *s;
-	s = malloc(sizeof(syndrome_struct));
-	s->syndrome = syndrome;
-	s->error = error;
+	uint64_t i = syndrome_hash(syndrome) & syndrome_map_mask;
 
-    HASH_ADD(hh, syndrome_map, syndrome, 8, s);
+	while (syndrome_map[i].syndrome != 0) {
+		if (syndrome_map[i].syndrome == syndrome)
+			return; /* keep the first (lowest weight) error pattern */
+		i = (i + 1) & syndrome_map_mask;
+	}
+	syndrome_map[i].syndrome = syndrome;
+	syndrome_map[i].error = error;
 }
 
-static syndrome_struct *find_syndrome(uint64_t syndrome)
+static const syndrome_struct *find_syndrome(uint64_t syndrome)
 {
-    syndrome_struct *s;
+	uint64_t i;
 
-    HASH_FIND(hh, syndrome_map, &syndrome, 8, s);
-    return s;
+	if (syndrome_map == NULL || syndrome == 0)
+		return NULL;
+	if (syndrome_bits != NULL) {
+		uint64_t b = syndrome_bit(syndrome);
+		if (!(syndrome_bits[b >> 6] & (1ULL << (b & 63))))
+			return NULL;
+	}
+	i = syndrome_hash(syndrome) & syndrome_map_mask;
+	while (syndrome_map[i].syndrome != 0) {
+		if (syndrome_map[i].syndrome == syndrome)
+			return &syndrome_map[i];
+		i = (i + 1) & syndrome_map_mask;
+	}
+	return NULL;
 }
 
 static uint64_t gen_syndrome(uint64_t codeword)
@@ -177,11 +221,51 @@ static void cycle(uint64_t error, int start, int depth, uint64_t codeword)
 	}
 }
 
-static void gen_syndrome_map(int bit_errors)
+static int gen_syndrome_map(int bit_errors)
 {
-	int i;
+	int i, k;
+	uint64_t entries = 0, binom = 1, size = 1;
+
+	/* number of error patterns of weight 1..bit_errors in 58 bits */
+	for (k = 1; k <= bit_errors; k++) {
+		binom = binom * (58 - k + 1) / k;
+		entries += binom;
+	}
+	/* keep the load factor at or below ~2/3 */
+	while (size < entries + entries / 2)
+		size <<= 1;
+
+	free(syndrome_map);
+	syndrome_map = (syndrome_struct *) calloc(size, sizeof(syndrome_struct));
+	if (syndrome_map == NULL) {
+		syndrome_map_mask = 0;
+		syndrome_map_errors = 0;
+		return -1;
+	}
+	syndrome_map_mask = size - 1;
+
 	for(i = 1; i <= bit_errors; i++)
 		cycle(0, 0, i, DEFAULT_AC);
+	syndrome_map_errors = bit_errors;
+
+	/* the prefilter: at least 2^16 bits, about 32 per entry, at most 2^28 */
+	free(syndrome_bits);
+	syndrome_bits = NULL;
+	{
+		uint64_t nbits = 1ULL << 16, j;
+		while (nbits < entries * 32 && nbits < (1ULL << 28))
+			nbits <<= 1;
+		syndrome_bits = (uint64_t *) calloc(nbits / 64, sizeof(uint64_t));
+		if (syndrome_bits != NULL) {
+			syndrome_bits_mask = nbits - 1;
+			for (j = 0; j <= syndrome_map_mask; j++)
+				if (syndrome_map[j].syndrome != 0) {
+					uint64_t b = syndrome_bit(syndrome_map[j].syndrome);
+					syndrome_bits[b >> 6] |= 1ULL << (b & 63);
+				}
+		}
+	}
+	return 0;
 }
 
 /* Generate Sync Word from an LAP */
@@ -198,8 +282,19 @@ uint64_t btbb_gen_syncword(const int LAP)
 	return codeword;
 }
 
+/* forget any FEC results decoded from the previous symbols */
+static void fec_cache_reset(btbb_packet *pkt)
+{
+	pkt->fec_hdr_state = 0;
+	pkt->fec13_pl_state = 0;
+	pkt->fec23_start = -1;
+	pkt->fec23_blocks = 0;
+	pkt->fec23_first_bad = -1;
+}
+
 static void init_packet(btbb_packet *pkt, uint32_t lap, uint8_t ac_errors)
 {
+	fec_cache_reset(pkt);
 	pkt->LAP = lap;
 	pkt->ac_errors = ac_errors;
 
@@ -285,8 +380,14 @@ int btbb_init(int max_ac_errors)
 		return -1;
 	}
 
-	if ((syndrome_map == NULL) && (max_ac_errors))
-		gen_syndrome_map(max_ac_errors);
+	/* (re)build the table if it does not cover max_ac_errors yet */
+	if (max_ac_errors > syndrome_map_errors) {
+		if (gen_syndrome_map(max_ac_errors) < 0) {
+			fprintf(stderr, "%s: unable to allocate syndrome table\n",
+				__FUNCTION__);
+			return -1;
+		}
+	}
 
 	return 0;
 }
@@ -295,9 +396,10 @@ btbb_packet *
 btbb_packet_new(void)
 {
 	btbb_packet *pkt = (btbb_packet *)calloc(1, sizeof(btbb_packet));
-	if(pkt)
+	if(pkt) {
 		pkt->refcount = 1;
-	else
+		fec_cache_reset(pkt);
+	} else
 		fprintf(stderr, "Unable to allocate packet");
 	return pkt;
 }
@@ -367,70 +469,94 @@ uint8_t btbb_packet_get_ac_errors(const btbb_packet *pkt) {
 
 int promiscuous_packet_search(char *stream, int search_length, uint32_t *lap,
 							  int max_ac_errors, uint8_t *ac_errors) {
-	uint64_t syncword, codeword, syndrome, corrected_barker;
-	syndrome_struct *errors;
-	char *symbols;
+	uint64_t window, syncword, codeword, syndrome, corrected_barker;
+	const syndrome_struct *errors;
 	int count, offset = -1;
 
-	/* Barker code at end of sync word (includes
-	 * MSB of LAP) is used as a rough filter.
-	 */
-	uint8_t barker = air_to_host8(&stream[57], 6);
-	barker <<= 1;
+	if (search_length <= 0)
+		return -1;
 
+	/* Slide a 64 bit window along the stream: symbol count + i is bit i.
+	 * The Barker code at the end of the sync word (bits 57-63, with the
+	 * MSB of the LAP) is a cheap first filter. */
+	window = air_to_host64(stream, 64);
 	for (count = 0; count < search_length; count++) {
-		symbols = &stream[count];
-		barker >>= 1;
-		barker |= (symbols[63] << 6);
-		if (BARKER_DISTANCE[barker] <= MAX_BARKER_ERRORS) {
-			// Error correction
-			syncword = air_to_host64(symbols, 64);
+		if (count)
+			window = (window >> 1) |
+				((uint64_t)(stream[count + 63] & 1) << 63);
+		if (BARKER_DISTANCE[window >> 57] > MAX_BARKER_ERRORS)
+			continue;
 
-			/* correct the barker code with a simple comparison */
-			corrected_barker = barker_correct[(uint8_t)(syncword >> 57)];
-			syncword = (syncword & 0x01ffffffffffffffULL) | corrected_barker;
+		/* correct the barker code with a simple comparison */
+		corrected_barker = barker_correct[(uint8_t)(window >> 57)];
+		syncword = (window & 0x01ffffffffffffffULL) | corrected_barker;
 
-			codeword = syncword ^ pn;
+		codeword = syncword ^ pn;
 
-			/* Zero syndrome -> good codeword. */
-			syndrome = gen_syndrome(codeword);
-			*ac_errors = 0;
+		/* Zero syndrome -> good codeword. */
+		syndrome = gen_syndrome(codeword);
+		*ac_errors = 0;
 
-			/* Try to fix errors in bad codeword. */
-			if (syndrome) {
-				errors = find_syndrome(syndrome);
-				if (errors != NULL) {
-					syncword ^= errors->error;
-					*ac_errors = count_bits(errors->error);
-					syndrome = 0;
-				}
-				else {
-					*ac_errors = 0xff;  // fail
-				}
+		/* Try to fix errors in bad codeword. */
+		if (syndrome) {
+			errors = find_syndrome(syndrome);
+			if (errors != NULL) {
+				syncword ^= errors->error;
+				*ac_errors = count_bits(errors->error);
 			}
-
-			if (*ac_errors <= max_ac_errors) {
-				*lap = (syncword >> 34) & 0xffffff;
-				offset = count;
-				break;
+			else {
+				*ac_errors = 0xff;  // fail
 			}
+		}
+
+		if (*ac_errors <= max_ac_errors) {
+			*lap = (syncword >> 34) & 0xffffff;
+			offset = count;
+			break;
 		}
 	}
 	return offset;
 }
 
 /* Matching a specific LAP */
+/* ones in a byte */
+#define B2(n) n, n + 1, n + 1, n + 2
+#define B4(n) B2(n), B2(n + 1), B2(n + 1), B2(n + 2)
+#define B6(n) B4(n), B4(n + 1), B4(n + 1), B4(n + 2)
+static const uint8_t ones8[256] = { B6(0), B6(1), B6(1), B6(2) };
+#undef B2
+#undef B4
+#undef B6
+
 int find_known_lap(char *stream, int search_length, uint32_t lap,
 				   int max_ac_errors, uint8_t *ac_errors) {
+	static uint32_t last_lap = 0xffffffff;
+	static uint64_t last_ac;
 	uint64_t syncword, ac;
-	char *symbols;
 	int count, offset = -1;
 
-	ac = btbb_gen_syncword(lap);
+	if (search_length <= 0)
+		return -1;
+
+	/* the same LAP is searched for bank after bank */
+	if (lap != last_lap) {
+		last_ac = btbb_gen_syncword(lap);
+		last_lap = lap;
+	}
+	ac = last_ac;
+	/* slide a 64 bit window along the stream instead of rebuilding the
+	 * whole syncword at every offset */
+	syncword = air_to_host64(stream, 64);
 	for (count = 0; count < search_length; count++) {
-		symbols = &stream[count];
-		syncword = air_to_host64(symbols, 64);
-		*ac_errors = count_bits(syncword ^ ac);
+		uint64_t d;
+		if (count)
+			syncword = (syncword >> 1) |
+				((uint64_t)(stream[count + 63] & 1) << 63);
+		d = syncword ^ ac;
+		/* the low 16 bits alone rule out most offsets */
+		if (ones8[d & 0xff] + ones8[(d >> 8) & 0xff] > max_ac_errors)
+			continue;
+		*ac_errors = count_bits(d);
 
 		if (*ac_errors <= max_ac_errors) {
 			offset = count;
@@ -457,10 +583,83 @@ int btbb_find_ac(char *stream, int search_length, uint32_t lap,
 	if (offset >= 0) {
 		if (*pkt_ptr == NULL)
 			*pkt_ptr = btbb_packet_new();
+		if (*pkt_ptr == NULL)
+			return -1;
 		init_packet(*pkt_ptr, lap, ac_errors);
 	}
 
 	return offset;
+}
+
+/* Does a promiscuous match at offset p (of 'avail' symbols) look like a
+ * real packet rather than a random 64 bit word within reach of a codeword? */
+static int ac_plausible(const char *s, int p, int avail, uint32_t lap, int errors)
+{
+	int i, bad;
+
+	if (errors == 0)
+		return 1;
+	/* inquiry access codes 0x9e8b00-0x9e8b3f: ID packets, no header */
+	if ((lap & 0xffffc0) == 0x9e8b00)
+		return 1;
+	/* header: 18 bits, each sent three times (FEC 1/3), from p + 68 */
+	if (p + 68 + 54 <= avail) {
+		int agree = 0;
+		for (i = 0; i < 18; i++) {
+			const char *t = &s[p + 68 + 3 * i];
+			agree += ((t[0] ^ t[1]) | (t[1] ^ t[2])) & 1 ? 0 : 1;
+		}
+		if (agree >= 12)
+			return 1;
+	}
+	if (errors > 1)
+		return 0;
+	/* one error: the preamble (alternating into the first sync symbol)
+	 * and the trailer (alternating out of the last) must be intact */
+	if (p + 68 > avail)
+		return 0;
+	bad = 0;
+	for (i = 0; i < 4; i++)
+		bad += (s[p + 64 + i] & 1) != ((s[p + 63] & 1) ^ !(i & 1));
+	if (bad > 1)
+		return 0;
+	if (p >= 4) {
+		bad = 0;
+		for (i = 1; i <= 4; i++)
+			bad += (s[p - i] & 1) != ((s[p] & 1) ^ (i & 1));
+		if (bad > 1)
+			return 0;
+	}
+	return 1;
+}
+
+int btbb_find_ac_checked(char *stream, int search_length, int stream_length,
+                         uint32_t lap, int max_ac_errors, btbb_packet **pkt_ptr)
+{
+	int pos = 0, offset;
+	uint8_t ac_errors;
+	uint32_t found;
+
+	if (lap != LAP_ANY)
+		return btbb_find_ac(stream, search_length, lap, max_ac_errors, pkt_ptr);
+
+	while (pos < search_length) {
+		offset = promiscuous_packet_search(stream + pos, search_length - pos,
+		                                   &found, max_ac_errors, &ac_errors);
+		if (offset < 0)
+			return -1;
+		offset += pos;
+		if (ac_plausible(stream, offset, stream_length, found, ac_errors)) {
+			if (*pkt_ptr == NULL)
+				*pkt_ptr = btbb_packet_new();
+			if (*pkt_ptr == NULL)
+				return -1;
+			init_packet(*pkt_ptr, found, ac_errors);
+			return offset;
+		}
+		pos = offset + 1;
+	}
+	return -1;
 }
 
 /* Copy data (symbols) into packet and set rx data. */
@@ -471,8 +670,11 @@ void btbb_packet_set_data(btbb_packet *pkt, char *data, int length,
 
 	if (length > MAX_SYMBOLS)
 		length = MAX_SYMBOLS;
+	if (length < 0)
+		length = 0;
 	for (i = 0; i < length; i++)
 		pkt->symbols[i] = data[i];
+	fec_cache_reset(pkt);
 
 	pkt->length = length;
 	pkt->channel = channel;
@@ -581,89 +783,126 @@ static uint16_t fec23(uint16_t data)
 	return codeword;
 }
 
-/* Decode 2/3 rate FEC, a (15,10) shortened Hamming code */
-static char *unfec23(char *input, int length)
+/* Decode one block of 2/3 rate FEC, a (15,10) shortened Hamming code:
+ * 15 input symbols -> 10 output bits.  Returns 0 if the block has an
+ * uncorrectable error. */
+static int unfec23_block(const char *input, char *output)
 {
-	/* input points to the input data
-	 * length is length in bits of the data
-	 * before it was encoded with fec2/3 */
-	int iptr, optr, count;
-	char* output;
+	int count;
 	uint8_t diff, check;
 	uint16_t data, codeword;
 
-	diff = length % 10;
-	// padding at end of data
-	if(0!=diff)
-		length += (10 - diff);
+	// copy data to output
+	for(count=0;count<10;count++)
+		output[count] = input[count];
 
-	output = (char *) malloc(length);
+	// grab data and error check in host format
+	data = air_to_host16(input, 10);
+	check = air_to_host8(input+10, 5);
 
-	for (iptr = 0, optr = 0; optr<length; iptr += 15, optr += 10) {
-		// copy data to output
-		for(count=0;count<10;count++)
-			output[optr+count] = input[iptr+count];
+	// call fec23 on data to generate the codeword
+	codeword = fec23(data);
+	diff = check ^ (codeword >> 10);
 
-		// grab data and error check in host format
-		data = air_to_host16(input+iptr, 10);
-		check = air_to_host8(input+iptr+10, 5);
-
-		// call fec23 on data to generate the codeword
-		codeword = fec23(data);
-		diff = check ^ (codeword >> 10);
-
-		/* no errors or single bit errors (errors in the parity bit):
-		 * (a strong hint it's a real packet)
-		 * Otherwise we need to corret the output*/
-		if (diff & (diff - 1)) {
-			switch (diff) {
-			/* comments are the bit that's wrong and the value
-			* of diff in air order, from the BT spec */
-				// 1000000000 11010
-				case 0x0b: output[optr] ^= 1; break;
-				// 0100000000 01101
-				case 0x16: output[optr+1] ^= 1; break;
-				// 0010000000 11100
-				case 0x07: output[optr+2] ^= 1; break;
-				// 0001000000 01110
-				case 0x0e: output[optr+3] ^= 1; break;
-				// 0000100000 00111
-				case 0x1c: output[optr+4] ^= 1; break;
-				// 0000010000 11001
-				case 0x13: output[optr+5] ^= 1; break;
-				// 0000001000 10110
-				case 0x0d: output[optr+6] ^= 1; break;
-				// 0000000100 01011
-				case 0x1a: output[optr+7] ^= 1; break;
-				// 0000000010 11111
-				case 0x1f: output[optr+8] ^= 1; break;
-				// 0000000001 10101
-				case 0x15: output[optr+9] ^= 1; break;
-				/* not one of these errors, probably multiple bit errors
-				* or maybe not a real packet, safe to drop it? */
-				default: free(output); return 0;
-			}
+	/* no errors or single bit errors (errors in the parity bit):
+	 * (a strong hint it's a real packet)
+	 * Otherwise we need to corret the output*/
+	if (diff & (diff - 1)) {
+		switch (diff) {
+		/* comments are the bit that's wrong and the value
+		* of diff in air order, from the BT spec */
+			// 1000000000 11010
+			case 0x0b: output[0] ^= 1; break;
+			// 0100000000 01101
+			case 0x16: output[1] ^= 1; break;
+			// 0010000000 11100
+			case 0x07: output[2] ^= 1; break;
+			// 0001000000 01110
+			case 0x0e: output[3] ^= 1; break;
+			// 0000100000 00111
+			case 0x1c: output[4] ^= 1; break;
+			// 0000010000 11001
+			case 0x13: output[5] ^= 1; break;
+			// 0000001000 10110
+			case 0x0d: output[6] ^= 1; break;
+			// 0000000100 01011
+			case 0x1a: output[7] ^= 1; break;
+			// 0000000010 11111
+			case 0x1f: output[8] ^= 1; break;
+			// 0000000001 10101
+			case 0x15: output[9] ^= 1; break;
+			/* not one of these errors, probably multiple bit errors
+			* or maybe not a real packet, safe to drop it? */
+			default: return 0;
 		}
 	}
-	return output;
+	return 1;
 }
 
+/* Decode 2/3 rate FEC for 'length' data bits starting at symbol offset
+ * 'start' of the packet.  Results are cached in the packet (decoding is
+ * clock independent), so repeated calls for different clock candidates
+ * only decode each block once.  Returns a pointer to the decoded bits
+ * (valid until the packet's symbols change), or NULL if any of the
+ * blocks covering 'length' bits has an uncorrectable error.  The caller
+ * must make sure that ceil(length/10)*15 symbols are available. */
+static const char *unfec23(btbb_packet *pkt, int start, int length)
+{
+	int nblocks = (length + 9) / 10;
+
+	if (nblocks > FEC23_MAX_BLOCKS)
+		return NULL;
+
+	if (pkt->fec23_start != start) {
+		pkt->fec23_start = start;
+		pkt->fec23_blocks = 0;
+		pkt->fec23_first_bad = -1;
+	}
+
+	while (pkt->fec23_blocks < nblocks && pkt->fec23_first_bad < 0) {
+		int b = pkt->fec23_blocks;
+		if (!unfec23_block(&pkt->symbols[start + 15 * b],
+				   &pkt->fec23_data[10 * b]))
+			pkt->fec23_first_bad = b;
+		else
+			pkt->fec23_blocks++;
+	}
+
+	if (pkt->fec23_first_bad >= 0 && pkt->fec23_first_bad < nblocks)
+		return NULL;
+	return pkt->fec23_data;
+}
+
+/* 1/3 FEC decode of the 18 bit packet header (cached per packet) */
+static const char *unfec13_header(btbb_packet *pkt)
+{
+	if (pkt->fec_hdr_state == 0)
+		pkt->fec_hdr_state =
+			unfec13(pkt->symbols + 68, pkt->fec_hdr, 18) ? 1 : -1;
+	return (pkt->fec_hdr_state > 0) ? pkt->fec_hdr : NULL;
+}
 
 /* Remove the whitening from an air order array */
-static void unwhiten(char* input, char* output, int clock, int length, int skip, btbb_packet* pkt)
+static void unwhiten(const char* input, char* output, int clock, int length, int skip, btbb_packet* pkt)
 {
 	int count, index;
+
+	/* unwhiten if whitened, otherwise just copy input to output */
+	if (!btbb_packet_get_flag(pkt, BTBB_WHITENED)) {
+		for(count = 0; count < length; count++)
+			output[count] = input[count];
+		return;
+	}
+
 	index = INDICES[clock & 0x3f];
 	index += skip;
 	index %= 127;
 
 	for(count = 0; count < length; count++)
 	{
-		/* unwhiten if whitened, otherwise just copy input to output */
-		output[count] = btbb_packet_get_flag(pkt, BTBB_WHITENED) ?
-			input[count] ^ WHITENING_DATA[index] : input[count];
-		index += 1;
-		index %= 127;
+		output[count] = input[count] ^ WHITENING_DATA[index];
+		if (++index == 127)
+			index = 0;
 	}
 }
 
@@ -782,44 +1021,42 @@ static int payload_crc(btbb_packet* pkt)
 
 int fhs(int clock, btbb_packet* pkt)
 {
-	/* skip the access code and packet header */
-	char *stream = pkt->symbols + 122;
 	/* number of symbols remaining after access code and packet header */
 	int size = pkt->length - 122;
+	const char *corrected;
 
 	pkt->payload_length = 20;
 
 	if (size < pkt->payload_length * 12)
 		return 1; //FIXME should throw exception
 
-	char *corrected = unfec23(stream, pkt->payload_length * 8);
+	/* skip the access code and packet header */
+	corrected = unfec23(pkt, 122, pkt->payload_length * 8);
 	if (!corrected)
 		return 0;
 
 	/* try to unwhiten with known clock bits */
 	unwhiten(corrected, pkt->payload, clock, pkt->payload_length * 8, 18, pkt);
-	if (payload_crc(pkt)) {
-		free(corrected);
+	if (payload_crc(pkt))
 		return 1000;
-	}
 
 	/* try all 32 possible X-input values instead */
 	for (clock = 32; clock < 64; clock++) {
 		unwhiten(corrected, pkt->payload, clock, pkt->payload_length * 8, 18, pkt);
-		if (payload_crc(pkt)) {
-			free(corrected);
+		if (payload_crc(pkt))
 			return 1000;
-		}
 	}
 
 	/* failed to unwhiten */
-	free(corrected);
 	return 0;
 }
 
 /* decode payload header, return value indicates success */
-static int decode_payload_header(char *stream, int clock, int header_bytes, int size, int fec, btbb_packet* pkt)
+static int decode_payload_header(int start, int clock, int header_bytes, int size, int fec, btbb_packet* pkt)
 {
+	const char *stream = pkt->symbols + start;
+	const char *corrected;
+
 	if(header_bytes == 2)
 	{
 		if(size < 16)
@@ -827,11 +1064,10 @@ static int decode_payload_header(char *stream, int clock, int header_bytes, int 
 		if(fec) {
 			if(size < 30)
 				return 0; //FIXME should throw exception
-			char *corrected = unfec23(stream, 16);
+			corrected = unfec23(pkt, start, 16);
 			if (!corrected)
 				return 0;
 			unwhiten(corrected, pkt->payload_header, clock, 16, 18, pkt);
-			free(corrected);
 		} else {
 			unwhiten(stream, pkt->payload_header, clock, 16, 18, pkt);
 		}
@@ -843,16 +1079,18 @@ static int decode_payload_header(char *stream, int clock, int header_bytes, int 
 		if(fec) {
 			if(size < 15)
 				return 0; //FIXME should throw exception
-			char *corrected = unfec23(stream, 8);
+			corrected = unfec23(pkt, start, 8);
 			if (!corrected)
 				return 0;
 			unwhiten(corrected, pkt->payload_header, clock, 8, 18, pkt);
-			free(corrected);
 		} else {
 			unwhiten(stream, pkt->payload_header, clock, 8, 18, pkt);
 		}
 		/* payload length is payload body length + 1 byte payload header + 2 bytes CRC */
 		pkt->payload_length = air_to_host8(&pkt->payload_header[3], 5) + 3;
+		/* ... except for AUX1, which has no CRC */
+		if (pkt->packet_type == PACKET_TYPE_AUX1)
+			pkt->payload_length -= 2;
 	}
 	/* Try to set the max payload length to a sensible value,
 	 * especially when using strange data
@@ -864,6 +1102,10 @@ static int decode_payload_header(char *stream, int clock, int header_bytes, int 
 			break;
 		case PACKET_TYPE_DH1:
 			/* assuming DH1 but could be 2-DH1 (58) */
+			max_length = 30;
+			break;
+		case PACKET_TYPE_AUX1:
+			/* 1 byte payload header + up to 29 bytes, no CRC */
 			max_length = 30;
 			break;
 		case PACKET_TYPE_DV:
@@ -903,15 +1145,16 @@ int DM(int clock, btbb_packet* pkt)
 	/* maximum payload length */
 	int max_length;
 	/* skip the access code and packet header */
-	char *stream = pkt->symbols + 122;
+	int start = 122;
 	/* number of symbols remaining after access code and packet header */
 	int size = pkt->length - 122;
+	const char *corrected;
 
 	switch(pkt->packet_type)
 	{
 		case PACKET_TYPE_DV:
 			/* skip 80 voice bits, then treat the rest like a DM1 */
-			stream += 80;
+			start += 80;
 			size -= 80;
 			header_bytes = 1;
 			/* I don't think the length of the voice field ("synchronous data
@@ -934,21 +1177,25 @@ int DM(int clock, btbb_packet* pkt)
 		default: /* not a DM1/3/5 or DV */
 			return 0;
 	}
-	if(!decode_payload_header(stream, clock, header_bytes, size, 1, pkt))
+	if(!decode_payload_header(start, clock, header_bytes, size, 1, pkt))
 		return 0;
 	/* check that the length indicated in the payload header is within spec */
-	if(pkt->payload_length > max_length)
-		/* could be encrypted */
+	if(pkt->payload_length > max_length) {
+		/* could be encrypted; nothing of the payload was decoded */
+		pkt->payload_length = 0;
 		return 1;
+	}
 	bitlength = pkt->payload_length*8;
-	if(bitlength > size)
-		return 1; //FIXME should throw exception
+	/* 2/3 FEC: every 10 data bits occupy 15 symbols */
+	if(((bitlength + 9) / 10) * 15 > size) {
+		pkt->payload_length = 0;   /* not all received */
+		return 1;
+	}
 
-	char *corrected = unfec23(stream, bitlength);
+	corrected = unfec23(pkt, start, bitlength);
 	if (!corrected)
 		return 0;
 	unwhiten(corrected, pkt->payload, clock, bitlength, 18, pkt);
-	free(corrected);
 
 	if (payload_crc(pkt))
 		return 10;
@@ -987,20 +1234,24 @@ int DH(int clock, btbb_packet* pkt)
 		default: /* not a DH1/3/5 */
 			return 0;
 	}
-	if(!decode_payload_header(stream, clock, header_bytes, size, 0, pkt))
+	if(!decode_payload_header(122, clock, header_bytes, size, 0, pkt))
 		return 0;
 	/* check that the length indicated in the payload header is within spec */
-	if(pkt->payload_length > max_length)
-		/* could be encrypted */
+	if(pkt->payload_length > max_length) {
+		/* could be encrypted; nothing of the payload was decoded */
+		pkt->payload_length = 0;
 		return 1;
+	}
 	bitlength = pkt->payload_length*8;
-	if(bitlength > size)
-		return 1; //FIXME should throw exception
+	if(bitlength > size) {
+		pkt->payload_length = 0;   /* not all received */
+		return 1;
+	}
 
 	unwhiten(stream, pkt->payload, clock, bitlength, 18, pkt);
 
 	/* AUX1 has no CRC */
-	if (pkt->packet_type == 9)
+	if (pkt->packet_type == PACKET_TYPE_AUX1)
 		return 2;
 
 	if (payload_crc(pkt))
@@ -1043,10 +1294,7 @@ int EV3(int clock, btbb_packet* pkt)
 
 int EV4(int clock, btbb_packet* pkt)
 {
-	char *corrected;
-
-	/* skip the access code and packet header */
-	char *stream = pkt->symbols + 122;
+	const char *corrected;
 
 	/* number of symbols remaining after access code and packet header */
 	int size = pkt->length - 122;
@@ -1066,23 +1314,24 @@ int EV4(int clock, btbb_packet* pkt)
 	int syms = 0; /* number of symbols we have decoded */
 	int bits = 0; /* number of payload bits we have decoded */
 
-	pkt->payload_length = 1;
+	/* smallest payload: 1 byte + 2 bytes CRC (a shorter length would
+	 * make payload_crc() read before the start of the payload) */
+	pkt->payload_length = 3;
 
 	while (syms < maxlength) {
 
 		/* unfec/unwhiten next block (15 symbols -> 10 bits) */
 		if (syms + 15 > size)
 			return 1; //FIXME should throw exception
-		corrected = unfec23(stream + syms, 10);
+		/* skip the access code and packet header */
+		corrected = unfec23(pkt, 122, bits + 10);
 		if (!corrected) {
-			free(corrected);
 			if (syms < minlength)
 				return 0;
 			else
 				return 1;
 		}
-		unwhiten(corrected, pkt->payload + bits, clock, 10, 18 + bits, pkt);
-		free(corrected);
+		unwhiten(corrected + bits, pkt->payload + bits, clock, 10, 18 + bits, pkt);
 
 		/* check CRC one byte at a time */
 		while (pkt->payload_length * 8 <= bits) {
@@ -1144,23 +1393,25 @@ int HV(int clock, btbb_packet* pkt)
 	switch (pkt->packet_type) {
 		case PACKET_TYPE_HV1:
 			{
-			char corrected[80];
-			if (!unfec13(stream, corrected, 80))
+			/* 1/3 FEC is clock independent: decode once per packet */
+			if (pkt->fec13_pl_state == 0)
+				pkt->fec13_pl_state =
+					unfec13(stream, pkt->fec13_pl, 80) ? 1 : -1;
+			if (pkt->fec13_pl_state < 0)
 				return 0;
 			pkt->payload_length = 10;
 			btbb_packet_set_flag(pkt, BTBB_HAS_PAYLOAD, 1);
-			unwhiten(corrected, pkt->payload, clock, pkt->payload_length*8, 18, pkt);
+			unwhiten(pkt->fec13_pl, pkt->payload, clock, pkt->payload_length*8, 18, pkt);
 			}
 			break;
 		case PACKET_TYPE_HV2:
 			{
-			char *corrected = unfec23(stream, 160);
+			const char *corrected = unfec23(pkt, 122, 160);
 			if (!corrected)
 				return 0;
 			pkt->payload_length = 20;
 			btbb_packet_set_flag(pkt, BTBB_HAS_PAYLOAD, 1);
 			unwhiten(corrected, pkt->payload, clock, pkt->payload_length*8, 18, pkt);
-			free(corrected);
 			}
 			break;
 		case PACKET_TYPE_HV3:
@@ -1177,13 +1428,12 @@ int HV(int clock, btbb_packet* pkt)
  */
 uint8_t try_clock(int clock, btbb_packet* pkt)
 {
-	/* skip 72 bit access code */
-	char *stream = pkt->symbols + 68;
-	/* 18 bit packet header */
-	char header[18];
+	/* 18 bit packet header after the 72 bit access code; the 1/3 FEC
+	 * decode is cached as it is the same for every clock candidate */
+	const char *header = unfec13_header(pkt);
 	char unwhitened[18];
 
-	if (!unfec13(stream, header, 18))
+	if (!header)
 		return 0;
 	unwhiten(header, unwhitened, clock, 18, 0, pkt);
 	uint16_t hdr_data = air_to_host16(unwhitened, 10);
@@ -1197,13 +1447,12 @@ uint8_t try_clock(int clock, btbb_packet* pkt)
 /* decode the packet header */
 int btbb_decode_header(btbb_packet* pkt)
 {
-	/* skip 72 bit access code */
-	char *stream = pkt->symbols + 68;
-	/* 18 bit packet header */
-	char header[18];
+	/* 18 bit packet header after the 72 bit access code */
+	const char *header;
 	uint8_t UAP;
 
-	if (btbb_packet_get_flag(pkt, BTBB_CLK6_VALID) && unfec13(stream, header, 18)) {
+	if (btbb_packet_get_flag(pkt, BTBB_CLK6_VALID) &&
+	    (header = unfec13_header(pkt)) != NULL) {
 		unwhiten(header, pkt->packet_header, pkt->clkn, 18, 0, pkt);
 		uint16_t hdr_data = air_to_host16(pkt->packet_header, 10);
 		uint8_t hec = air_to_host8(&pkt->packet_header[10], 8);
@@ -1343,6 +1592,9 @@ char *tun_format(btbb_packet* pkt)
 	int length = 9 + pkt->payload_length;
 	char *tun_format = (char *) malloc(length);
 	int i;
+
+	if (!tun_format)
+		return NULL;
 
 	/* meta data */
 	tun_format[0] = pkt->clkn & 0xff;

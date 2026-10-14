@@ -29,6 +29,9 @@
 /* maximum number of payload bits */
 #define MAX_PAYLOAD_LENGTH 2744
 
+/* maximum number of 2/3 FEC blocks (10 data bits each) in a payload */
+#define FEC23_MAX_BLOCKS ((MAX_PAYLOAD_LENGTH + 9) / 10)
+
 /* minimum header bit errors to indicate that this is an ID packet */
 #define ID_THRESHOLD 5
 
@@ -109,6 +112,19 @@ struct btbb_packet {
 	uint16_t length; /* number of symbols */
 	char symbols[MAX_SYMBOLS];
 
+	/* Per-packet FEC decoding cache.  FEC decoding does not depend on
+	 * the clock, so during UAP/clock recovery (which tries all 64
+	 * CLK1-6 values) it only needs to be done once per packet; only the
+	 * unwhitening and CRC check are clock dependent.  Invalidated
+	 * whenever the symbols change (fec_cache_reset()). */
+	int fec_hdr_state;             /* 0 not decoded, 1 ok, -1 too many errors */
+	char fec_hdr[18];              /* 1/3 FEC decoded packet header */
+	int fec13_pl_state;            /* same, for the 80 bit HV1 payload */
+	char fec13_pl[80];
+	int fec23_start;               /* symbol offset of cached 2/3 FEC data, -1 none */
+	int fec23_blocks;              /* number of 15 symbol blocks decoded */
+	int fec23_first_bad;           /* first uncorrectable block, -1 none */
+	char fec23_data[FEC23_MAX_BLOCKS * 10];
 };
 
 /* type-specific CRC checks and decoding */

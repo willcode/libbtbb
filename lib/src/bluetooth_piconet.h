@@ -44,6 +44,16 @@ struct btbb_piconet {
 	/* Number of used channel derived from AFH channel map */
 	uint8_t used_channels;
 
+	/* afh_map is the piconet's actual map (given, or deduced once the
+	 * clock is known) rather than the channels it was seen on */
+	int afh_map_known;
+
+	/* AFH without the map: channels this attempt saw the piconet on, and
+	 * per clock candidate the hops the basic sequence predicted exactly
+	 * (bits 27-31 of a candidate count the hops it contradicts) */
+	uint8_t afh_seen[10];
+	uint8_t *cand_hits;
+
 	/* lower address part (of master's BD_ADDR) */
 	uint32_t LAP;
 
@@ -66,8 +76,18 @@ struct btbb_piconet {
 	/* frequency register bank */
 	int bank[BT_NUM_CHANNELS];
 
-	/* this holds the entire hopping sequence */
+	/* this holds the entire hopping sequence (owned by the piconet) */
 	char *sequence;
+
+	/* parameters the current contents of 'sequence' were generated for,
+	 * so it is only regenerated when they change */
+	int seq_valid;
+	uint32_t seq_lap_uap;
+	int seq_afh;
+	uint8_t seq_afh_map[10];
+
+	/* capacity of clock_candidates */
+	uint32_t max_candidates;
 
 	/* number of candidates for CLK1-27 */
 	int num_candidates;
@@ -80,6 +100,8 @@ struct btbb_piconet {
 
 	/* number of observed packets that have been used to winnow the candidates */
 	int winnowed;
+	/* packets observed while following since the last AFH map deduction */
+	int since_deduce;
 
 	/* CLK1-6 candidates */
 	int clock6_candidates[64];
