@@ -37,7 +37,13 @@ set(ENABLE_PYTHON ON CACHE BOOL "Build python tools")
 # Comment the following out for releases.
 set(CMAKE_C_FLAGS "$ENV{CFLAGS}" CACHE STRING "C Flags")
 
+option(BUILD_TESTING "Build the libbtbb regression tests (run with ctest)" ON)
+
 add_subdirectory(lib)
+if(BUILD_TESTING)
+	enable_testing()
+	add_subdirectory(lib/tests)
+endif()
 if(ENABLE_PYTHON)
 	add_subdirectory(python)
 endif()
